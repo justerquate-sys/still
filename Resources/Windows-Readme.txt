@@ -1,4 +1,4 @@
-Still 2.4.0 for Windows
+Still for Windows
 
 Extract the whole ZIP into a permanent folder, then open Still.exe.
 No installer, account, administrator privileges, or extra runtime is required.
@@ -25,6 +25,12 @@ Enable Launch at login after placing the app in its permanent folder.
 Choose Ctrl+Alt arrows in the tray menu if you want ordinary arrows elsewhere.
 The global freeze shortcut is Ctrl+Alt+Space.
 
+Automatic updates
+Install an updater-enabled release once. Still checks GitHub after startup and
+every six hours, verifies signed metadata and download hashes, and restarts only
+when captures, exports, and the dropdown are closed. The footer checks manually.
+Preferences and clipboard contents stay intact. Offline checks do not stop capture.
+
 240 Hz
 Still targets the active monitor's configured refresh rate, up to 240 Hz.
 Pointer movement has no easing. Only the automatic crop zoom is animated;
@@ -33,7 +39,8 @@ Set your monitor to 240 Hz in Windows Display settings to use that refresh rate.
 Actual frame presentation depends on your monitor, Windows, and GPU load.
 
 Images stay in memory. PNG and DIBV5 clipboard data retain the crop's original
-pixel dimensions. There is no recording history or network traffic.
+pixel dimensions. There is no recording history. Network requests only check
+and download signed software updates from GitHub.
 Windows' protected/secure surfaces cannot be captured. Capture uses SDR pixels;
 HDR fidelity is not guaranteed. Very large desktops can exceed a GPU limit.
 

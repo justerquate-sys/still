@@ -2,7 +2,17 @@
 
 # Still
 
-A native screenshot utility that lives in the macOS menu bar or Windows notification tray, written in Rust. There is no home window to open. Freeze the view, select a region, and carry on. macOS uses AppKit, ScreenCaptureKit, and CoreGraphics. Windows uses Win32, Direct2D, DirectWrite, and a pure Rust annotation rasterizer. PNG encoding runs in Rust on both platforms. No accounts, screenshot history, or network requests from the app.
+A native screenshot utility that lives in the macOS menu bar or Windows notification tray, written in Rust. There is no home window to open. Freeze the view, select a region, and carry on. macOS uses AppKit, ScreenCaptureKit, and CoreGraphics. Windows uses Win32, Direct2D, DirectWrite, and a pure Rust annotation rasterizer. PNG encoding runs in Rust on both platforms. Screenshots stay on your device. There are no accounts or screenshot history; network requests only check and download signed software updates from GitHub.
+
+[Download the latest release](https://github.com/justerquate-sys/still/releases/latest) · [Source](https://github.com/justerquate-sys/still)
+
+## Automatic updates
+
+Install an updater-enabled release once on each device. Still checks GitHub shortly after launch and every six hours. It downloads and verifies newer releases in the background, then installs and restarts when no capture, annotation, export, or dropdown is open. The footer in the dropdown shows update status and lets you check immediately. Quitting normally does not force a pending restart.
+
+Update metadata is signed with a pinned Ed25519 key, and each download must match its signed SHA-256 hash and size. A separate Rust helper waits for the app to exit, verifies the staged package again, and preserves the old version for recovery. Preferences and the clipboard are retained. Offline checks fail without interrupting capture.
+
+Mac personal releases use the same app-specific signing certificate across versions. They are **not Apple-notarized**; macOS may require its normal first-install or Screen Recording approval. Still does not disable Gatekeeper, remove quarantine, or change certificate trust. Developer ID notarization can be configured later. See [release setup](docs/RELEASING.md) for the publishing workflow and signing requirements.
 
 ## Your two keys
 
@@ -40,15 +50,15 @@ Requires **macOS 14 or later**, Xcode Command Line Tools, and **Rust/Cargo 1.99.
 
 The release build produces `build/Still.app`. Installation checks the bundle identity and signature, preserves a unique backup under `build/backups`, and installs to `~/Applications/Still.app`. Quit Still before installation. Build output and installed bundles are staged before replacement; failed replacement restores the previous bundle.
 
-Opening Still adds its crop icon to the menu bar without opening an app window or a Dock icon. Click the icon to open a compact dropdown containing capture, Screen Recording access, launch at login, shortcut preferences, and Quit. Click outside or press Escape to dismiss it. It uses macOS ServiceManagement for launch at login, respects the system’s actual setting, and preserves the previous version’s shortcut preference, login state, and capture count. Opening the app again reveals that same dropdown or active capture.
+Opening Still adds its crop icon to the menu bar without opening an app window or a Dock icon. Click the icon to open a compact dropdown containing capture, Screen Recording access, launch at login, shortcut preferences, update status, and Quit. Click outside or press Escape to dismiss it. It uses macOS ServiceManagement for launch at login, respects the system’s actual setting, and preserves the previous version’s shortcut preference, login state, and capture count. Opening the app again reveals that same dropdown or active capture.
 
-Enable **Screen Recording / Screen & System Audio Recording** when macOS requests it. If macOS asks you to quit and reopen, do so. Local builds are ad hoc signed; rebuilding can require renewed permission. Set `STILL_SIGNING_IDENTITY` to a suitable signing identity when building for distribution, which also requires notarization.
+Enable **Screen Recording / Screen & System Audio Recording** when macOS requests it. If macOS asks you to quit and reopen, do so. Local builds are ad hoc signed; rebuilding can require renewed permission. For distribution, use the persistent personal signing or Developer ID packaging described in [release setup](docs/RELEASING.md).
 
 ## Windows download and build
 
-The portable x64 package is `dist/Still-2.4.0-windows-x64.zip`. Extract it into a permanent folder and open `Still.exe`. The app starts in the notification area without a home window. Click the crop icon for the compact dropdown; right-click for the native fallback menu. Enable **Launch at login** there after placing it in that folder. It uses the current user's startup registry entry; no administrator privileges are required. Turn that preference off before removing or moving the executable.
+Portable Windows packages are on [the latest GitHub release](https://github.com/justerquate-sys/still/releases/latest). Extract it into a permanent folder and open `Still.exe`. The app starts in the notification area without a home window. Click the crop icon for the compact dropdown; right-click for the native fallback menu. Enable **Launch at login** there after placing it in that folder. It uses the current user's startup registry entry; no administrator privileges are required. Turn that preference off before removing or moving the executable.
 
-The Windows port targets **Windows 10 version 1803+ and Windows 11**, initially on Intel/AMD x64. The local package is cross-compiled on Mac and unsigned. Shared logic and image tests run on Mac; actual Windows desktop behavior and 240 Hz hardware presentation still need Windows hardware validation. The repository contains a native Windows CI workflow, but it has not been run in this local workspace.
+The Windows port targets **Windows 10 version 1803+ and Windows 11**, with release builds for x64 and ARM64. The local package is cross-compiled on Mac and unsigned. Shared logic and image tests run on Mac; actual Windows desktop behavior and 240 Hz hardware presentation still need Windows hardware validation. Native Windows CI runs unit tests and the executable self-test.
 
 To build on Windows, install Rust/Cargo **1.99.1** and Microsoft's C++ Build Tools with the Windows SDK. In PowerShell:
 

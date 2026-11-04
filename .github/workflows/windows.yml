@@ -1,0 +1,38 @@
+name: Windows
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup show
+      - name: Format, lint, and unit tests
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --target x86_64-pc-windows-msvc --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --target x86_64-pc-windows-msvc --all-targets --locked
+          exit $LASTEXITCODE
+      - name: Package native Windows x64 build
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - name: Executable self-test
+        shell: pwsh
+        run: |
+          $test = Start-Process target/x86_64-pc-windows-msvc/release/Still.exe -ArgumentList '--self-test' -Wait -PassThru
+          exit $test.ExitCode
+      - name: Upload portable build
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: Still-windows-x64
+          path: dist/*
+          if-no-files-found: error

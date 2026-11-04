@@ -20,6 +20,7 @@ pub fn load() -> TrayState {
         is_capturing: false,
         copied_count: defaults.integerForKey(ns_string!("copiedCount")).max(0) as usize,
         error: None,
+        update_status: Default::default(),
     };
     refresh(&mut state);
     state

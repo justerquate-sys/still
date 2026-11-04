@@ -7,9 +7,9 @@ use crate::{
     drawing::{Stamp, Tool},
     editor::{COLORS, CacheRequest, Editor, RasterCacheState},
     geometry,
-    model::CaptureMode,
+    model::{CaptureMode, UpdateStatus},
     portable_image::{self as image, EncodedImage, Image},
-    refresh,
+    refresh, updater,
 };
 use render::{Renderer, r};
 use std::{
@@ -30,6 +30,8 @@ use windows::{
     core::{PCWSTR, w},
 };
 const CLASS: PCWSTR = w!("Still.Native.Window");
+const UPDATE_STARTUP_DELAY: Duration = Duration::from_secs(10);
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 thread_local! {static EVENTS:RefCell<VecDeque<Event>>=const{RefCell::new(VecDeque::new())};}
 #[derive(Clone, Copy)]
@@ -354,6 +356,50 @@ enum Reply {
     Captured(u64, Result<(Image, Rect, Rect, f64), String>),
     Exported(u64, Result<EncodedImage, String>),
     Raster(u64, CacheRequest, Result<Image, String>),
+    UpdateChecked(Result<Option<updater::PreparedUpdate>, String>),
+    UpdateApplyReady(Result<updater::ApplyProcess, String>),
+}
+struct Updates {
+    config: Option<Arc<updater::Config>>,
+    status: UpdateStatus,
+    next_check: Option<Instant>,
+    checking: bool,
+    prepared: Option<Arc<updater::PreparedUpdate>>,
+    applying: bool,
+    apply: Option<updater::ApplyProcess>,
+    exit_for_update: bool,
+}
+impl Updates {
+    fn disabled() -> Self {
+        Self {
+            config: None,
+            status: UpdateStatus::NotConfigured,
+            next_check: None,
+            checking: false,
+            prepared: None,
+            applying: false,
+            apply: None,
+            exit_for_update: false,
+        }
+    }
+    fn new(ui_test: bool) -> Self {
+        let mut updates = Self::disabled();
+        if !ui_test {
+            match updater::Config::embedded() {
+                Ok(Some(config)) => {
+                    updates.config = Some(Arc::new(config));
+                    updates.status = UpdateStatus::Idle;
+                    updates.next_check = Some(Instant::now() + UPDATE_STARTUP_DELAY);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    updates.status = UpdateStatus::Failed(error.to_string());
+                    updates.next_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
+                }
+            }
+        }
+        updates
+    }
 }
 struct App {
     hotkeys: Option<native::Hotkeys>,
@@ -367,6 +413,7 @@ struct App {
     receiver: mpsc::Receiver<Reply>,
     sender: mpsc::Sender<Reply>,
     generation: u64,
+    image_workers: usize,
     capturing: bool,
     pending_mode: CaptureMode,
     deadline: Option<Instant>,
@@ -375,6 +422,7 @@ struct App {
     login: bool,
     error: Option<String>,
     shortcut_error: Option<String>,
+    updates: Updates,
     dirty: bool,
     next_frame: Instant,
     rate: f64,
@@ -430,6 +478,18 @@ fn local_capture_action(
     let local_chord = !control && !shift && !alt;
     (!repeated && (local_chord || global_chord) && !(global_chord && registered)).then_some(id)
 }
+fn update_idle(
+    capture: bool,
+    acquiring: bool,
+    image_workers: usize,
+    popup: bool,
+    quit: bool,
+) -> bool {
+    !capture && !acquiring && image_workers == 0 && !popup && !quit
+}
+fn update_action_enabled(status: &UpdateStatus) -> bool {
+    status.can_check()
+}
 impl App {
     fn new() -> Result<Self, String> {
         let ui_test = std::env::args().any(|s| s == "--ui-test");
@@ -466,6 +526,7 @@ impl App {
             receiver,
             sender,
             generation: 0,
+            image_workers: 0,
             capturing: false,
             pending_mode: CaptureMode::Copy,
             deadline: None,
@@ -474,6 +535,7 @@ impl App {
             login: native::login_enabled(),
             error: None,
             shortcut_error,
+            updates: Updates::new(ui_test),
             dirty: true,
             next_frame: Instant::now(),
             rate,
@@ -530,7 +592,7 @@ impl App {
         let (bounds, scale) = tray.panel_placement();
         self.panel_scale = scale;
         self.host.size = bounds.size;
-        self.host.buttons = panel_buttons(self.modified, self.login, scale);
+        self.host.buttons = panel_buttons(self.modified, self.login, scale, &self.updates.status);
         if let Some(renderer) = self.host.renderer.as_mut()
             && renderer
                 .resize(bounds.size.width as u32, bounds.size.height as u32)
@@ -622,6 +684,7 @@ impl App {
         self.focus = None;
         self.hover = None;
         self.pressed = None;
+        self.image_workers += 1;
         native::worker(self.sender.clone(), self.host.handle, move || {
             native::flush_desktop();
             Reply::Captured(
@@ -661,7 +724,41 @@ impl App {
     }
     fn replies(&mut self) {
         while let Ok(reply) = self.receiver.try_recv() {
+            // A canceled capture invalidates its generation, but its native/image
+            // workers must still finish before an automatic update may restart us.
+            if matches!(
+                &reply,
+                Reply::Mosaic(..) | Reply::Captured(..) | Reply::Exported(..) | Reply::Raster(..)
+            ) {
+                self.image_workers = self.image_workers.saturating_sub(1);
+            }
             match reply {
+                Reply::UpdateChecked(result) if self.updates.checking => {
+                    self.updates.checking = false;
+                    self.updates.next_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
+                    match result {
+                        Ok(Some(prepared)) => {
+                            self.updates.status = UpdateStatus::Ready(prepared.version_string());
+                            self.updates.prepared = Some(Arc::new(prepared));
+                            self.updates.next_check = None;
+                        }
+                        Ok(None) => self.updates.status = UpdateStatus::UpToDate,
+                        Err(error) => self.updates.status = UpdateStatus::Failed(error),
+                    }
+                    self.dirty |= self.panel.visible;
+                }
+                Reply::UpdateApplyReady(result) if self.updates.applying => {
+                    self.updates.applying = false;
+                    match result {
+                        Ok(guard) => self.updates.apply = Some(guard),
+                        Err(error) => {
+                            self.updates.prepared = None;
+                            self.updates.status = UpdateStatus::Failed(error);
+                            self.updates.next_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
+                        }
+                    }
+                    self.dirty |= self.panel.visible;
+                }
                 Reply::Mosaic(generation, revision, result) if generation == self.generation => {
                     let again = if let Some(c) = self.capture.as_mut() {
                         let error = result.as_ref().err().cloned();
@@ -780,6 +877,84 @@ impl App {
             }
         }
     }
+    fn check_for_updates(&mut self) {
+        if self.ui_test
+            || self.quit
+            || self.updates.checking
+            || self.updates.prepared.is_some()
+            || self.updates.applying
+            || self.updates.apply.is_some()
+        {
+            return;
+        }
+        if self.updates.config.is_none() {
+            match updater::Config::embedded() {
+                Ok(Some(config)) => self.updates.config = Some(Arc::new(config)),
+                Ok(None) => {
+                    self.updates.status = UpdateStatus::NotConfigured;
+                    self.updates.next_check = None;
+                    self.dirty |= self.panel.visible;
+                    return;
+                }
+                Err(error) => {
+                    self.updates.status = UpdateStatus::Failed(error.to_string());
+                    self.updates.next_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
+                    self.dirty |= self.panel.visible;
+                    return;
+                }
+            }
+        }
+        let config = Arc::clone(self.updates.config.as_ref().unwrap());
+        self.updates.checking = true;
+        self.updates.status = UpdateStatus::Checking;
+        self.updates.next_check = None;
+        self.dirty |= self.panel.visible;
+        native::worker(self.sender.clone(), self.host.handle, move || {
+            Reply::UpdateChecked(
+                updater::InstallContext::current()
+                    .and_then(|context| updater::check_and_stage(&config, &context))
+                    .map_err(|error| error.to_string()),
+            )
+        });
+    }
+    fn poll_updates(&mut self, now: Instant) {
+        if self.ui_test || self.quit {
+            return;
+        }
+        if self
+            .updates
+            .next_check
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.check_for_updates();
+        }
+        if !update_idle(
+            self.capture.is_some(),
+            self.capturing,
+            self.image_workers,
+            self.panel.visible,
+            self.quit,
+        ) {
+            return;
+        }
+        if self.updates.apply.is_some() {
+            // The helper waits on its uncommitted pipe. A capture or open popup
+            // that began during helper setup has now finished naturally.
+            self.updates.exit_for_update = true;
+            self.quit = true;
+        } else if !self.updates.applying
+            && let Some(prepared) = self.updates.prepared.as_ref().map(Arc::clone)
+        {
+            self.updates.applying = true;
+            self.updates.status = UpdateStatus::Installing(prepared.version_string());
+            self.updates.next_check = None;
+            native::worker(self.sender.clone(), self.host.handle, move || {
+                Reply::UpdateApplyReady(
+                    updater::start_apply(&prepared).map_err(|error| error.to_string()),
+                )
+            });
+        }
+    }
     fn copied(&mut self, display: Rect) {
         let scale = native::display_scale(POINT {
             x: (display.origin.x + display.size.width * 0.5) as i32,
@@ -870,6 +1045,7 @@ impl App {
             return;
         };
         let generation = self.generation;
+        self.image_workers += 1;
         native::worker(self.sender.clone(), self.host.handle, move || {
             Reply::Mosaic(
                 generation,
@@ -898,6 +1074,7 @@ impl App {
         c.message = None;
         let marks = c.editor.marks.clone();
         let generation = self.generation;
+        self.image_workers += 1;
         native::worker(self.sender.clone(), self.host.handle, move || {
             Reply::Exported(
                 generation,
@@ -972,6 +1149,7 @@ impl App {
         };
         let marks = c.editor.marks[request.from..request.to].to_vec();
         let generation = self.generation;
+        self.image_workers += 1;
         native::worker(self.sender.clone(), self.host.handle, move || {
             Reply::Raster(generation, request, image::render(&image, &marks))
         });
@@ -1048,6 +1226,15 @@ impl App {
                             .as_mut()
                             .and_then(|keys| keys.register(next).err());
                     }
+                }
+            }
+            15 => {
+                if matches!(self.updates.status, UpdateStatus::Ready(_)) {
+                    if self.capture.is_none() && !self.capturing {
+                        self.dismiss_panel(true);
+                    }
+                } else if update_action_enabled(&self.updates.status) {
+                    self.check_for_updates();
                 }
             }
             20..=26 => {
@@ -1520,7 +1707,7 @@ impl App {
         Ok(())
     }
     fn draw_panel(&mut self) -> Result<(), String> {
-        let buttons = panel_buttons(self.modified, self.login, 1.);
+        let buttons = panel_buttons(self.modified, self.login, 1., &self.updates.status);
         let error = self.error.as_deref().or(self.shortcut_error.as_deref());
         let renderer = self.host.renderer()?;
         renderer.begin(render::BG);
@@ -1611,17 +1798,36 @@ impl App {
             render::RAISED,
             1.,
         );
-        let quit = &buttons[5];
+        let update = &buttons[5];
+        panel_row(renderer, update, self.hover, self.focus);
+        renderer.text(
+            &self.updates.status.label(),
+            r(24., 375., 210., 22.),
+            11,
+            false,
+            match self.updates.status {
+                UpdateStatus::Ready(_) => render::LIME,
+                UpdateStatus::Failed(_) => render::ERROR,
+                UpdateStatus::NotConfigured => render::MUTED,
+                _ => render::SECONDARY,
+            },
+        );
+        let quit = &buttons[6];
         panel_row(renderer, quit, self.hover, self.focus);
         renderer.text(
             "Quit Still",
-            r(24., 375., 276., 22.),
+            r(260., 375., 64., 22.),
             12,
             false,
             render::SECONDARY,
         );
         renderer.end().map_err(|e| e.to_string())?;
-        self.host.buttons = panel_buttons(self.modified, self.login, self.panel_scale);
+        self.host.buttons = panel_buttons(
+            self.modified,
+            self.login,
+            self.panel_scale,
+            &self.updates.status,
+        );
         Ok(())
     }
 }
@@ -1635,7 +1841,7 @@ fn panel_status(error: Option<&str>) -> String {
     }
     text
 }
-fn panel_buttons(modified: bool, login: bool, scale: f64) -> Vec<Button> {
+fn panel_buttons(modified: bool, login: bool, scale: f64, status: &UpdateStatus) -> Vec<Button> {
     let mut copy = Button::new(1, r(16., 80., 308., 80.), "Capture & copy");
     copy.subtitle = "Select a region, then copy".into();
     copy.key = if modified { "Ctrl+Alt ↑" } else { "↑" }.into();
@@ -1649,8 +1855,10 @@ fn panel_buttons(modified: bool, login: bool, scale: f64) -> Vec<Button> {
     plain.selected = !modified;
     let mut alternate = Button::new(12, r(182., 312., 142., 32.), "Ctrl+Alt ↑ / ↓");
     alternate.selected = modified;
-    let quit = Button::new(5, r(16., 368., 308., 28.), "Quit Still");
-    let mut buttons = vec![copy, draw, launch, plain, alternate, quit];
+    let mut update = Button::new(15, r(16., 368., 226., 28.), &status.label());
+    update.enabled = update_action_enabled(status);
+    let quit = Button::new(5, r(250., 368., 74., 28.), "Quit Still");
+    let mut buttons = vec![copy, draw, launch, plain, alternate, update, quit];
     for b in &mut buttons {
         b.rect = r(
             b.rect.origin.x * scale,
@@ -1691,10 +1899,10 @@ fn draw_brand(renderer: &Renderer, origin: Point, size: f64) {
     }
 }
 fn panel_row(renderer: &Renderer, b: &Button, hover: Option<i32>, focus: Option<i32>) {
-    if hover == Some(b.id) {
+    if b.enabled && hover == Some(b.id) {
         renderer.fill(b.rect, 6., render::SURFACE);
     }
-    if focus == Some(b.id) {
+    if b.enabled && focus == Some(b.id) {
         renderer.outline(b.rect, 6., render::LIME, 1.5);
     }
 }
@@ -2273,6 +2481,10 @@ fn execute() -> Result<(), String> {
             if app.toast.as_ref().is_some_and(|(_, expiry)| now >= *expiry) {
                 app.toast = None;
             }
+            app.poll_updates(now);
+            if app.quit {
+                break;
+            }
             let moving = app.capture.as_ref().is_some_and(|c| c.zoom.is_some());
             if (app.dirty || moving) && now >= app.next_frame {
                 app.next_frame = refresh::next_frame_deadline(app.next_frame, now, app.rate);
@@ -2299,10 +2511,14 @@ fn execute() -> Result<(), String> {
             }
             let moving = app.capture.as_ref().is_some_and(|c| c.zoom.is_some());
             let frame = (app.dirty || moving).then_some(app.next_frame);
-            let expiry = [app.toast.as_ref().map(|(_, expiry)| *expiry), app.deadline]
-                .into_iter()
-                .flatten()
-                .min();
+            let expiry = [
+                app.toast.as_ref().map(|(_, expiry)| *expiry),
+                app.deadline,
+                app.updates.next_check,
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let deadline = match (frame, expiry) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -2311,11 +2527,19 @@ fn execute() -> Result<(), String> {
                 timer.wait(deadline);
             }
         }
+        if app.updates.exit_for_update
+            && let Some(guard) = app.updates.apply.take()
+        {
+            // Commit only on the successful normal exit path. The helper cannot
+            // install until the OS closes this process's retained pipe at exit.
+            guard.commit_on_exit();
+        }
         Ok(())
     }
 }
 fn self_test() -> Result<(), String> {
     panel_geometry_test()?;
+    update_policy_test()?;
     let source = image::synthetic(64, 48)?;
     let crop = image::crop(&source, r(5., 7., 21., 17.), r(0., 0., 64., 48.))?;
     let mut editor = Editor::default();
@@ -2484,7 +2708,7 @@ fn panel_geometry_test() -> Result<(), String> {
             return Err("Tray panel opened across its taskbar anchor".into());
         }
         for modified in [false, true] {
-            let buttons = panel_buttons(modified, true, scale);
+            let buttons = panel_buttons(modified, true, scale, &UpdateStatus::Idle);
             for b in &buttons {
                 let center = Point::new(
                     b.rect.origin.x + b.rect.size.width / 2.,
@@ -2553,6 +2777,48 @@ fn panel_geometry_test() -> Result<(), String> {
     }
     Ok(())
 }
+fn update_policy_test() -> Result<(), String> {
+    for mask in 0..32 {
+        if update_idle(
+            mask & 1 != 0,
+            mask & 2 != 0,
+            usize::from(mask & 4 != 0),
+            mask & 8 != 0,
+            mask & 16 != 0,
+        ) != (mask == 0)
+        {
+            return Err("Automatic update can interrupt a capture, worker, popup, or exit".into());
+        }
+    }
+    for (status, enabled) in [
+        (UpdateStatus::NotConfigured, false),
+        (UpdateStatus::Idle, true),
+        (UpdateStatus::Checking, false),
+        (UpdateStatus::UpToDate, true),
+        (UpdateStatus::Ready("2.5.0".into()), true),
+        (UpdateStatus::Installing("2.5.0".into()), false),
+        (UpdateStatus::Failed("Offline".into()), true),
+    ] {
+        if update_action_enabled(&status) != enabled {
+            return Err("Tray update control permits duplicate or unconfigured work".into());
+        }
+    }
+    let disabled = Updates::new(true);
+    if disabled.config.is_some()
+        || disabled.next_check.is_some()
+        || disabled.checking
+        || disabled.prepared.is_some()
+        || disabled.applying
+        || disabled.apply.is_some()
+        || disabled.exit_for_update
+        || !matches!(disabled.status, UpdateStatus::NotConfigured)
+        || UPDATE_STARTUP_DELAY != Duration::from_secs(10)
+        || UPDATE_CHECK_INTERVAL != Duration::from_secs(6 * 60 * 60)
+    {
+        return Err("Diagnostic mode unexpectedly enabled background updates".into());
+    }
+    Ok(())
+}
 fn panel_native_test() -> Result<(), String> {
     // A hidden diagnostic host exercises native rendering and actual event
     // dispatch without creating tray icons, taking screenshots, or writing settings.
@@ -2588,6 +2854,7 @@ fn panel_native_test() -> Result<(), String> {
         receiver,
         sender,
         generation: 0,
+        image_workers: 0,
         capturing: false,
         pending_mode: CaptureMode::Copy,
         deadline: None,
@@ -2596,6 +2863,7 @@ fn panel_native_test() -> Result<(), String> {
         login: false,
         error: None,
         shortcut_error: None,
+        updates: Updates::disabled(),
         dirty: true,
         next_frame: Instant::now(),
         rate: 60.,
@@ -2630,10 +2898,65 @@ fn panel_native_test() -> Result<(), String> {
         return Err("Tray panel stayed interactive after deactivation".into());
     }
     app.panel.visible = true;
-    app.host.buttons = panel_buttons(app.modified, app.login, 1.);
+    app.host.buttons = panel_buttons(app.modified, app.login, 1., &app.updates.status);
     app.event(Event::Key(VK_ESCAPE.0 as u32, false, false, false));
     if app.panel.visible || !app.host.buttons.is_empty() {
         return Err("Escape did not dismiss the tray panel".into());
+    }
+    app.updates.status = UpdateStatus::Idle;
+    app.panel.visible = true;
+    app.focus = None;
+    app.draw_panel()?;
+    for id in [1, 2, 10, 11, 12, 15, 5] {
+        app.event(Event::Key(VK_TAB.0 as u32, false, false, false));
+        if app.focus != Some(id) {
+            return Err("Tray update action is missing from keyboard focus order".into());
+        }
+    }
+    app.activate(15);
+    app.updates.next_check = Some(Instant::now());
+    app.poll_updates(Instant::now() + UPDATE_STARTUP_DELAY);
+    if app.updates.checking || app.updates.applying || app.updates.apply.is_some() || app.quit {
+        return Err("Diagnostic mode started an update network/apply worker".into());
+    }
+    // Update replies are independent of capture generations and worker counts.
+    app.generation = 7;
+    app.image_workers = 1;
+    app.updates.checking = true;
+    app.sender
+        .send(Reply::UpdateChecked(Ok(None)))
+        .map_err(|error| error.to_string())?;
+    app.replies();
+    if !matches!(app.updates.status, UpdateStatus::UpToDate)
+        || app.updates.checking
+        || app.image_workers != 1
+        || app.updates.next_check.is_none()
+    {
+        return Err("A capture generation invalidated an independent update check".into());
+    }
+    app.sender
+        .send(Reply::Exported(6, Err("Canceled diagnostic export".into())))
+        .map_err(|error| error.to_string())?;
+    app.replies();
+    if app.image_workers != 0 || app.capture.is_some() || app.capturing {
+        return Err("Canceled image workers did not release deferred updates".into());
+    }
+    app.updates.applying = true;
+    app.sender
+        .send(Reply::UpdateApplyReady(Err(
+            "Diagnostic helper failure".into()
+        )))
+        .map_err(|error| error.to_string())?;
+    app.replies();
+    if app.updates.applying
+        || app.updates.apply.is_some()
+        || app.updates.next_check.is_none()
+        || !matches!(app.updates.status, UpdateStatus::Failed(_))
+        || app.quit
+    {
+        return Err(
+            "Failed update helper interrupted the running utility or lost its retry".into(),
+        );
     }
     Ok(())
 }
