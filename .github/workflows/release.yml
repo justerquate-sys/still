@@ -260,6 +260,7 @@ jobs:
           trap 'rm -f "$key_path"' EXIT
           printf '%s' "$UPDATE_SIGNING_KEY" > "$key_path"
           unset UPDATE_SIGNING_KEY
+          # Bash 3.2 treats empty arrays as unset under nounset; expand them conditionally below.
           previous=()
           if [[ -d "$RUNNER_TEMP/previous-still-release" ]]; then
             previous=(--previous-manifest "$RUNNER_TEMP/previous-still-release/updates.json" --previous-signature "$RUNNER_TEMP/previous-still-release/updates.json.sig")
@@ -267,9 +268,9 @@ jobs:
           signing_policy=()
           if [[ "$MACOS_SIGNING_MODE" == personal ]]; then signing_policy=(--allow-personal-macos); fi
           target/release/still-release sign --private-key "$key_path" --artifacts dist --version "$VERSION" \
-            --repo "$RELEASE_REPOSITORY" --config Resources/update-config.json --require-platforms "$REQUIRED_PLATFORMS" "${previous[@]}" "${signing_policy[@]}"
+            --repo "$RELEASE_REPOSITORY" --config Resources/update-config.json --require-platforms "$REQUIRED_PLATFORMS" ${previous[@]+"${previous[@]}"} ${signing_policy[@]+"${signing_policy[@]}"}
           target/release/still-release verify --manifest dist/updates.json --signature dist/updates.json.sig \
-            --config Resources/update-config.json --artifacts dist --version "$VERSION" --repo "$RELEASE_REPOSITORY" --require-platforms "$REQUIRED_PLATFORMS" "${signing_policy[@]}"
+            --config Resources/update-config.json --artifacts dist --version "$VERSION" --repo "$RELEASE_REPOSITORY" --require-platforms "$REQUIRED_PLATFORMS" ${signing_policy[@]+"${signing_policy[@]}"}
       - name: Stage a draft release with every validated archive and the signed feed
         run: |
           gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/updates.json dist/updates.json.sig \
