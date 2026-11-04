@@ -1,0 +1,82 @@
+[package]
+name = "still"
+version = "2.4.0"
+edition = "2024"
+rust-version = "1.99.1"
+description = "A native Rust screenshot and markup app for macOS and Windows"
+publish = false
+
+[[bin]]
+name = "Still"
+path = "src/main.rs"
+
+[dependencies]
+png = "0.18.1"
+tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+# Enable only the native APIs Still uses. Framework defaults also link unrelated
+# CloudKit, CoreData, AVFoundation, Metal, and other libraries at process startup.
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSEnumerator",
+    "NSError", "NSGeometry", "NSNotification", "NSObjCRuntime", "NSObject",
+    "NSRunLoop", "NSString", "NSURL", "NSUserDefaults", "NSValue",
+    "objc2-core-foundation",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std", "libc", "block2", "NSAccessibility", "NSAccessibilityProtocols", "NSAppearance", "NSApplication",
+    "NSAttributedString", "NSBezierPath", "NSButton", "NSButtonCell", "NSCell",
+    "NSColor", "NSControl", "NSCursor", "NSEvent", "NSFont", "NSFontDescriptor",
+    "NSGradient", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSMenu",
+    "NSMenuItem", "NSPanel", "NSPopover", "NSViewController", "NSParagraphStyle", "NSPasteboard", "NSPasteboardItem",
+    "NSResponder", "NSRunningApplication", "NSScreen", "NSSegmentedCell",
+    "NSSegmentedControl", "NSShadow", "NSStatusBar", "NSStatusBarButton",
+    "NSStatusItem", "NSStringDrawing", "NSSwitch", "NSText", "NSTextField", "NSTrackingArea",
+    "NSView", "NSWindow", "NSWorkspace", "NSTextView", "NSTextContainer", "NSBitmapImageRep", "objc2-core-foundation",
+    "objc2-core-graphics", "objc2-quartz-core",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std", "CFData", "CFNumber", "CFString", "CFCGTypes", "objc2",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std", "CGBitmapContext", "CGColor", "CGColorSpace", "CGContext",
+    "CGDataProvider", "CGGeometry", "CGImage", "CGPath", "CGWindow", "CGWindowLevel",
+    "objc2",
+] }
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
+    "std", "SCScreenshotManager", "SCShareableContent", "SCStream", "block2",
+    "libc", "objc2-core-foundation", "objc2-core-graphics",
+] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = [
+    "std", "SMAppService", "objc2", "objc2-foundation",
+] }
+objc2-image-io = { version = "0.3.2", default-features = false, features = [
+    "std", "CGImageDestination", "CGImageProperties", "CGImageSource", "objc2-core-graphics",
+] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
+    "std", "CAAnimation", "CABase", "CADisplayLink", "CAFrameRateRange",
+    "CALayer", "CAMediaTiming", "CAMediaTimingFunction", "CATransaction", "CATransform3D",
+    "objc2-core-foundation", "objc2-core-graphics",
+] }
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Imaging", "Win32_UI_Controls",
+    "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm", "Win32_System_Com", "Win32_System_LibraryLoader",
+    "Win32_System_Memory", "Win32_System_DataExchange", "Win32_System_Threading",
+    "Win32_System_Registry", "Win32_Security", "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"
+] }
+windows-numerics = "0.3.1"

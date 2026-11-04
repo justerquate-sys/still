@@ -1,0 +1,20 @@
+Still uses open-source Rust packages under their respective licenses.
+The complete dependency versions are recorded in Cargo.lock in the source.
+Rust standard-library notices are included under Licenses/Rust.
+Cross-built GNU editions also include MinGW-w64 and GCC runtime notices;
+GCC runtime code is distributed under its runtime library exception.
+
+windows, windows-core, windows-interface, windows-implement, windows-link,
+windows-result, windows-strings, windows-threading, windows-numerics,
+windows-collections, windows-future: Microsoft Corporation, MIT OR Apache-2.0
+tiny-skia and tiny-skia-path: Yevhenii Reizner and contributors, BSD-3-Clause
+png, fdeflate: image-rs contributors, MIT OR Apache-2.0
+flate2, miniz_oxide, crc32fast, simd-adler32, adler2, bitflags, cfg-if,
+bytemuck, arrayvec, arrayref, strict-num, log, proc-macro2, quote,
+syn, unicode-ident: see the accompanying Licenses directory.
+
+Interface design guidance adapted from unslop by Damir Sokolovsky (@heydamir).
+https://github.com/heydamir/unslop
+Licensed under Creative Commons Attribution 4.0 International.
+https://creativecommons.org/licenses/by/4.0/
+Adapted for a native Rust desktop screenshot interface.
