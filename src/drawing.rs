@@ -26,7 +26,7 @@ impl Tool {
     }
 }
 /// Immutable, prepared pixels. Native upload formats are created once, never
-/// during pointer tracking. A mosaic is shared by every effect on one capture.
+/// during pointer tracking. A synthetic texture is shared by redactions on one capture.
 #[derive(Clone, Debug)]
 pub struct Stamp {
     pub pixels: crate::portable_image::Image,
@@ -73,10 +73,46 @@ impl Stamp {
             ),
         );
         let pixel = crate::geometry::pixel_rect(requested, bounds, bounds.size)
-            .ok_or("Empty pixelation area")?;
+            .ok_or("Empty redaction area")?;
         let cropped = crate::portable_image::crop(&self.pixels, pixel, bounds)?;
         Self::at(cropped, pixel.origin)
     }
+}
+
+/// A small collar strictly outside the rounded-out exported crop. Automatic
+/// redaction tone may read these regions, never pixels within any exported area.
+/// Empty collars (including a full-screen crop) deliberately yield no samples.
+pub(crate) fn redaction_sample_regions(
+    width: usize,
+    height: usize,
+    crop: crate::coordinates::Rect,
+) -> [crate::coordinates::Rect; 4] {
+    use crate::coordinates::{Rect, Size};
+    let width = width as f64;
+    let height = height as f64;
+    let left = crop.origin.x.floor().clamp(0., width);
+    let top = crop.origin.y.floor().clamp(0., height);
+    let right = (crop.origin.x + crop.size.width).ceil().clamp(left, width);
+    let bottom = (crop.origin.y + crop.size.height).ceil().clamp(top, height);
+    let collar = 8.;
+    [
+        Rect::new(
+            Point::new(left, (top - collar).max(0.)),
+            Size::new(right - left, top.min(collar)),
+        ),
+        Rect::new(
+            Point::new(left, bottom),
+            Size::new(right - left, (height - bottom).min(collar)),
+        ),
+        Rect::new(
+            Point::new((left - collar).max(0.), top),
+            Size::new(left.min(collar), bottom - top),
+        ),
+        Rect::new(
+            Point::new(right, top),
+            Size::new((width - right).min(collar), bottom - top),
+        ),
+    ]
 }
 #[derive(Clone, Debug)]
 pub struct Mark {
@@ -117,5 +153,43 @@ impl Mark {
                 last.y - head * (angle + spread).sin(),
             ),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinates::{Rect, Size};
+
+    #[test]
+    fn automatic_tone_collars_exclude_every_rounded_export_pixel() {
+        let bounds = Rect::new(Point::new(7., 11.), Size::new(40., 30.));
+        for selection in [
+            bounds,
+            Rect::new(Point::new(9.125, 15.375), Size::new(18.2, 9.4)),
+            Rect::new(Point::new(7., 11.), Size::new(8.5, 7.25)),
+            Rect::new(Point::new(32.75, 33.25), Size::new(14.25, 7.75)),
+        ] {
+            let crop = crate::geometry::pixel_rect(selection, bounds, Size::new(80., 60.)).unwrap();
+            let regions = redaction_sample_regions(80, 60, crop);
+            for region in regions {
+                for y in region.origin.y as usize..(region.origin.y + region.size.height) as usize {
+                    for x in
+                        region.origin.x as usize..(region.origin.x + region.size.width) as usize
+                    {
+                        assert!(x < 80 && y < 60);
+                        assert!(
+                            (x as f64) < crop.origin.x
+                                || (x as f64) >= crop.origin.x + crop.size.width
+                                || (y as f64) < crop.origin.y
+                                || (y as f64) >= crop.origin.y + crop.size.height
+                        );
+                    }
+                }
+            }
+            if selection == bounds {
+                assert!(regions.iter().all(|r| r.size.width * r.size.height == 0.));
+            }
+        }
     }
 }

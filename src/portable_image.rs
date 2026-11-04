@@ -159,10 +159,10 @@ fn draw_ink(pix: &mut PixmapMut<'_>, mark: &Mark, halo: bool) {
         let mut path = PathBuilder::new();
         if mark.tool == Tool::PixelateArea {
             if let Some(rect) = tiny_skia::Rect::from_ltrb(
-                first.x.min(last.x) as f32,
-                first.y.min(last.y) as f32,
-                first.x.max(last.x) as f32,
-                first.y.max(last.y) as f32,
+                first.x.min(last.x).floor() as f32,
+                first.y.min(last.y).floor() as f32,
+                first.x.max(last.x).ceil() as f32,
+                first.y.max(last.y).ceil() as f32,
             ) {
                 path.push_rect(rect);
             }
@@ -198,7 +198,10 @@ fn draw_ink(pix: &mut PixmapMut<'_>, mark: &Mark, halo: bool) {
             }
             let mut mask = tiny_skia::Mask::new(pix.width(), pix.height())
                 .expect("validated image dimensions");
-            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            // Redaction replaces whole pixels. Fractional coverage would mix
+            // the hidden screenshot back into the pattern at mask boundaries.
+            // Ink and text keep their normal anti-aliasing below.
+            mask.fill_path(&path, FillRule::Winding, false, Transform::identity());
             pix.draw_pixmap(
                 stamp.origin.x.round() as i32,
                 stamp.origin.y.round() as i32,
@@ -292,41 +295,6 @@ fn draw_ink(pix: &mut PixmapMut<'_>, mark: &Mark, halo: bool) {
         );
     }
 }
-/// A fixed grid sampled once from the frozen crop. Every mask uses these same
-/// pixels, so strokes do not shimmer or change color as the pointer moves.
-pub fn pixelated(
-    image: &Image,
-    cell: usize,
-) -> Result<std::sync::Arc<crate::drawing::Stamp>, String> {
-    let cell = cell.clamp(4, 128);
-    let mut pix = image.0.rgba.clone();
-    let w = image.width();
-    let h = image.height();
-    for y in (0..h).step_by(cell) {
-        for x in (0..w).step_by(cell) {
-            let right = (x + cell).min(w);
-            let bottom = (y + cell).min(h);
-            let count = ((right - x) * (bottom - y)) as u64;
-            let mut sum = [0u64; 4];
-            for yy in y..bottom {
-                for xx in x..right {
-                    let i = (yy * w + xx) * 4;
-                    for (c, s) in sum.iter_mut().enumerate() {
-                        *s += image.pixels()[i + c] as u64;
-                    }
-                }
-            }
-            let avg = sum.map(|s| ((s + count / 2) / count) as u8);
-            for yy in y..bottom {
-                for xx in x..right {
-                    let i = (yy * w + xx) * 4;
-                    pix.data_mut()[i..i + 4].copy_from_slice(&avg);
-                }
-            }
-        }
-    }
-    crate::drawing::Stamp::new(Image::from_pixmap(pix))
-}
 pub struct EncodedImage {
     pub png: Vec<u8>,
     pub dibv5: Vec<u8>,
@@ -400,35 +368,373 @@ pub fn synthetic(width: usize, height: usize) -> Result<Image, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinates::Point;
+    use crate::{coordinates::Point, drawing::Stamp};
+
     fn r(x: f64, y: f64, w: f64, h: f64) -> Rect {
         Rect::new(Point::new(x, y), Size::new(w, h))
     }
-    #[test]
-    fn mosaic_masks_keep_unselected_pixels_and_original_source() {
-        let source = synthetic(64, 48).unwrap();
-        let original = source.pixels().to_vec();
-        let mosaic = pixelated(&source, 8).unwrap();
-        let at = |image: &Image, x: usize, y: usize| {
-            image.pixels()[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].to_vec()
-        };
-        assert_eq!(at(&mosaic.pixels, 9, 9), at(&mosaic.pixels, 14, 14));
-        let mut area = Mark {
-            tool: Tool::PixelateArea,
-            points: vec![Point::new(10., 10.), Point::new(30., 24.)],
+
+    fn pattern(width: usize, height: usize) -> Arc<Stamp> {
+        let image = crate::redaction::generate(
+            width,
+            height,
+            8,
+            [0x7b; 32],
+            crate::redaction::Palette {
+                background: [229, 234, 239],
+            },
+        )
+        .unwrap();
+        assert!(
+            image
+                .pixels()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[3] == 255)
+        );
+        Stamp::new(image).unwrap()
+    }
+
+    fn redaction(tool: Tool, points: &[(f64, f64)], width: f64, stamp: &Arc<Stamp>) -> Mark {
+        Mark {
+            tool,
+            points: points.iter().map(|&(x, y)| Point::new(x, y)).collect(),
             color: [1.; 4],
-            width: 5.,
-            stamp: Some(mosaic.clone()),
-        };
-        let result = render(&source, &[area.clone()]).unwrap();
-        assert_eq!(at(&result, 12, 12), at(&mosaic.pixels, 12, 12));
-        assert_eq!(at(&result, 8, 12), at(&source, 8, 12));
-        area.tool = Tool::PixelateBrush;
-        area.points = vec![Point::new(8., 32.), Point::new(52., 32.)];
-        let result = render(&source, &[area]).unwrap();
-        assert_eq!(at(&result, 25, 32), at(&mosaic.pixels, 25, 32));
-        assert_eq!(at(&result, 25, 20), at(&source, 25, 20));
-        assert_eq!(source.pixels(), original);
+            width,
+            stamp: Some(stamp.clone()),
+        }
+    }
+
+    // Observe the actual protected pixels without depending on the generated
+    // texture's colors. Every touched mask pixel must be a complete replacement.
+    fn protected_pixels(width: usize, height: usize, marks: &[Mark]) -> Vec<bool> {
+        let black = Image::from_rgba(width, height, [0, 0, 0, 255].repeat(width * height)).unwrap();
+        let white =
+            Stamp::new(Image::from_rgba(width, height, [255; 4].repeat(width * height)).unwrap())
+                .unwrap();
+        let probes: Vec<_> = marks
+            .iter()
+            .map(|mark| Mark {
+                stamp: Some(white.clone()),
+                ..mark.clone()
+            })
+            .collect();
+        render(&black, &probes)
+            .unwrap()
+            .pixels()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| {
+                assert!(
+                    *p == [0, 0, 0, 255] || *p == [255; 4],
+                    "redaction coverage must be binary, got {p:?}"
+                );
+                p[0] == 255
+            })
+            .collect()
+    }
+
+    // The outside pixels are identical. Inside, use unrelated text-like rows,
+    // colors, and alpha values, including transparent and partially opaque data.
+    fn hidden_sources(width: usize, height: usize, protected: &[bool]) -> [Image; 3] {
+        std::array::from_fn(|variant| {
+            let mut rgba = Vec::with_capacity(width * height * 4);
+            for y in 0..height {
+                for x in 0..width {
+                    let outside = [
+                        (37 + x * 3 % 111) as u8,
+                        (53 + y * 5 % 103) as u8,
+                        83,
+                        (71 + (x + y) % 185) as u8,
+                    ];
+                    let text = y % 11 < 6 && x % 7 < 4;
+                    let secret = match variant {
+                        0 => {
+                            if text {
+                                [0, 0, 0, 255]
+                            } else {
+                                [255; 4]
+                            }
+                        }
+                        1 => [
+                            (x * 17 % 256) as u8,
+                            (y * 29 % 256) as u8,
+                            if text { 251 } else { 7 },
+                            if text { 31 } else { 0 },
+                        ],
+                        _ => [255, 4, (x * 13 + y * 19) as u8, 197],
+                    };
+                    rgba.extend_from_slice(if protected[y * width + x] {
+                        &secret
+                    } else {
+                        &outside
+                    });
+                }
+            }
+            Image::from_rgba(width, height, rgba).unwrap()
+        })
+    }
+
+    fn assert_same_exports(images: &[Image]) {
+        let reference = &images[0];
+        let expected = encode(reference).unwrap();
+        for image in &images[1..] {
+            assert_eq!(
+                (image.width(), image.height()),
+                (reference.width(), reference.height())
+            );
+            assert_eq!(image.pixels(), reference.pixels());
+            assert_eq!(image.bgra(), reference.bgra());
+            let actual = encode(image).unwrap();
+            assert_eq!(
+                actual.png, expected.png,
+                "PNG retained hidden pixel information"
+            );
+            assert_eq!(
+                actual.dibv5, expected.dibv5,
+                "DIBV5 retained hidden pixel information"
+            );
+        }
+        let mut reader = png::Decoder::new(std::io::Cursor::new(expected.png))
+            .read_info()
+            .unwrap();
+        let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut decoded).unwrap();
+        assert_eq!(
+            (info.width as usize, info.height as usize),
+            (reference.width(), reference.height())
+        );
+        assert_eq!(
+            &expected.dibv5[4..8],
+            &(reference.width() as u32).to_le_bytes()
+        );
+        assert_eq!(
+            &expected.dibv5[8..12],
+            &(-(reference.height() as i32)).to_le_bytes()
+        );
+        for (i, p) in reference.pixels().as_chunks::<4>().0.iter().enumerate() {
+            if p[3] == 255 {
+                assert_eq!(&decoded[i * 4..i * 4 + 4], p);
+                assert_eq!(
+                    &expected.dibv5[124 + i * 4..128 + i * 4],
+                    &[p[2], p[1], p[0], 255]
+                );
+            }
+        }
+    }
+
+    // Hold mask, seed, and explicit palette fixed; vary only the protected
+    // source pixels. The exported bytes must carry no information about them.
+    fn assert_private_redactions(width: usize, height: usize, marks: &[Mark]) -> Vec<bool> {
+        let protected = protected_pixels(width, height, marks);
+        assert!(protected.iter().any(|&p| p));
+        assert!(protected.iter().any(|&p| !p));
+        let sources = hidden_sources(width, height, &protected);
+        let before: Vec<_> = sources
+            .iter()
+            .map(|image| image.pixels().to_vec())
+            .collect();
+        let outputs: Vec<_> = sources
+            .iter()
+            .map(|source| render(source, marks).unwrap())
+            .collect();
+        assert_same_exports(&outputs);
+        for (source, (original, output)) in sources.iter().zip(before.iter().zip(&outputs)) {
+            assert_eq!(source.pixels(), original, "redaction mutated its source");
+            assert_eq!((output.width(), output.height()), (width, height));
+            for (i, &covered) in protected.iter().enumerate() {
+                let pixel = &output.pixels()[i * 4..i * 4 + 4];
+                if covered {
+                    assert_eq!(pixel[3], 255, "protected pixel retained source alpha");
+                } else {
+                    assert_eq!(
+                        pixel,
+                        &source.pixels()[i * 4..i * 4 + 4],
+                        "outside pixel changed"
+                    );
+                }
+            }
+        }
+        protected
+    }
+
+    #[test]
+    fn fractional_redaction_rectangles_round_outward_and_remove_hidden_pixels() {
+        let (width, height) = (63, 47);
+        let stamp = pattern(width, height);
+        assert_eq!(
+            stamp.pixels.pixels(),
+            pattern(width, height).pixels.pixels()
+        );
+        for (points, bounds) in [
+            ([(30.25, 25.75), (11.1, 9.4)], (11, 9, 31, 26)),
+            ([(-3.7, 4.2), (15.01, 21.2)], (0, 4, 16, 22)),
+            ([(49.3, 35.8), (80.2, 59.1)], (49, 35, 63, 47)),
+            ([(12.4, 7.3), (12.6, 7.8)], (12, 7, 13, 8)),
+        ] {
+            let mark = redaction(Tool::PixelateArea, &points, 5., &stamp);
+            let protected = assert_private_redactions(width, height, &[mark]);
+            for y in 0..height {
+                for x in 0..width {
+                    assert_eq!(
+                        protected[y * width + x],
+                        x >= bounds.0 && y >= bounds.1 && x < bounds.2 && y < bounds.3,
+                        "fractional rectangle coverage at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn brush_dots_and_overlapping_round_strokes_remove_hidden_pixels_from_exports() {
+        let (width, height) = (63, 47);
+        let stamp = pattern(width, height);
+        let dot = redaction(Tool::PixelateBrush, &[(18.35, 20.65)], 6.2, &stamp);
+        let coverage = assert_private_redactions(width, height, std::slice::from_ref(&dot));
+        assert!(coverage[20 * width + 18]);
+        assert!(!coverage[20 * width + 3]);
+        let repeated_dot = redaction(Tool::PixelateBrush, &[(18.35, 20.65); 2], 6.2, &stamp);
+        assert_eq!(coverage, protected_pixels(width, height, &[repeated_dot]));
+        let stroke = redaction(
+            Tool::PixelateBrush,
+            &[(11.2, 13.4), (28.8, 19.25), (14.9, 31.8), (35.3, 33.6)],
+            4.7,
+            &stamp,
+        );
+        let overlapping = redaction(
+            Tool::PixelateBrush,
+            &[(8.3, 33.1), (31.7, 11.6), (46.4, 20.2)],
+            5.3,
+            &stamp,
+        );
+        let coverage = assert_private_redactions(width, height, &[dot, stroke, overlapping]);
+        for (x, y) in [(11, 13), (28, 19), (15, 31), (35, 33), (8, 33), (46, 20)] {
+            assert!(coverage[y * width + x]);
+        }
+        assert!(!coverage[44 * width + 60]);
+    }
+
+    #[test]
+    fn committed_cropped_redactions_later_marks_and_history_keep_export_privacy() {
+        let (width, height) = (96, 80);
+        let full_stamp = pattern(width, height);
+        let mut editor = crate::editor::Editor::default();
+        let (revision, _, _) = editor.pixelation_job().unwrap();
+        editor.complete_pixelation(revision, Some(full_stamp.clone()));
+        editor.tool = Tool::PixelateArea;
+        assert!(editor.begin(Point::new(8.35, 9.6), 0.45));
+        editor.drag(Point::new(56.2, 31.8));
+        let area_preview = editor.current.clone().unwrap();
+        editor.end(Point::new(56.2, 31.8));
+        editor.tool = Tool::PixelateBrush;
+        assert!(editor.begin(Point::new(36.2, 28.3), 0.45));
+        editor.drag(Point::new(48.7, 43.6));
+        editor.drag(Point::new(65.4, 38.2));
+        editor.drag(Point::new(53.8, 54.7));
+        let mut brush_preview = editor.current.clone().unwrap();
+        brush_preview.points.push(Point::new(72.4, 56.9));
+        editor.end(Point::new(72.4, 56.9));
+        let preview_marks = [area_preview, brush_preview];
+        let redactions = editor.marks.clone();
+        for mark in &redactions {
+            let patch = mark.stamp.as_ref().unwrap();
+            assert!(patch.pixels.width() < width && patch.pixels.height() < height);
+            assert!(patch.origin.x > 0. && patch.origin.y > 0.);
+        }
+        let protected = assert_private_redactions(width, height, &redactions);
+        let sources = hidden_sources(width, height, &protected);
+        let redacted: Vec<_> = sources
+            .iter()
+            .map(|source| render(source, &redactions).unwrap())
+            .collect();
+        for (source, committed) in sources.iter().zip(&redacted) {
+            assert_eq!(
+                render(source, &preview_marks).unwrap().pixels(),
+                committed.pixels()
+            );
+        }
+
+        editor.tool = Tool::Highlighter;
+        assert!(editor.begin(Point::new(17.4, 22.3), 1.));
+        editor.end(Point::new(75.8, 43.6));
+        let highlighted: Vec<_> = sources
+            .iter()
+            .map(|source| render(source, &editor.marks).unwrap())
+            .collect();
+        assert_same_exports(&highlighted);
+        let text =
+            Stamp::new(Image::from_rgba(7, 5, [240, 13, 73, 143].repeat(35)).unwrap()).unwrap();
+        assert!(editor.insert_text(Point::new(30.3, 17.8), text));
+        let annotated: Vec<_> = sources
+            .iter()
+            .map(|source| render(source, &editor.marks).unwrap())
+            .collect();
+        assert_same_exports(&annotated);
+        for (source, output) in sources.iter().zip(&annotated) {
+            let first_two = render(source, &editor.marks[..2]).unwrap();
+            let incremental = render(&first_two, &editor.marks[2..]).unwrap();
+            assert_eq!(incremental.pixels(), output.pixels());
+            for (i, &covered) in protected.iter().enumerate() {
+                if covered {
+                    assert_eq!(output.pixels()[i * 4 + 3], 255);
+                }
+            }
+        }
+        let crops: Vec<_> = annotated
+            .iter()
+            .map(|image| {
+                crop(
+                    image,
+                    r(3.2, 4.1, 84.3, 67.8),
+                    r(0., 0., width as f64, height as f64),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!((crops[0].width(), crops[0].height()), (85, 68));
+        assert_same_exports(&crops);
+
+        editor.undo();
+        assert_eq!(
+            render(&sources[0], &editor.marks).unwrap().pixels(),
+            highlighted[0].pixels()
+        );
+        editor.undo();
+        assert_eq!(
+            render(&sources[0], &editor.marks).unwrap().pixels(),
+            redacted[0].pixels()
+        );
+        let patch_identity = editor.marks[1].stamp.as_ref().unwrap().pixels.identity();
+        // Undo intentionally exposes the source again. Redo reuses exactly the
+        // committed pattern rather than sampling it or generating another one.
+        editor.undo();
+        assert_ne!(
+            render(&sources[0], &editor.marks).unwrap().pixels(),
+            render(&sources[1], &editor.marks).unwrap().pixels()
+        );
+        editor.redo();
+        assert_eq!(
+            editor.marks[1].stamp.as_ref().unwrap().pixels.identity(),
+            patch_identity
+        );
+        assert_eq!(
+            render(&sources[0], &editor.marks).unwrap().pixels(),
+            redacted[0].pixels()
+        );
+        editor.redo();
+        editor.redo();
+        let restored: Vec<_> = sources
+            .iter()
+            .map(|source| render(source, &editor.marks).unwrap())
+            .collect();
+        assert_same_exports(&restored);
+        assert_eq!(
+            encode(&restored[0]).unwrap().png,
+            encode(&annotated[0]).unwrap().png
+        );
     }
     #[test]
     fn prepared_text_stamp_keeps_orientation_and_history() {

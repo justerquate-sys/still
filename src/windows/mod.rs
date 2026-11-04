@@ -5,7 +5,7 @@ mod text;
 use crate::{
     coordinates::{Point, Rect, Size},
     drawing::{Stamp, Tool},
-    editor::{COLORS, CacheRequest, Editor, RasterCacheState},
+    editor::{COLORS, CacheRequest, Editor, RasterCacheState, RedactionTone},
     geometry,
     model::{CaptureMode, UpdateStatus},
     portable_image::{self as image, EncodedImage, Image},
@@ -343,6 +343,7 @@ struct Capture {
     selection: Rect,
     start: Option<Point>,
     crop: Option<Image>,
+    redaction_selection: Rect,
     raster: Option<Image>,
     cache: RasterCacheState,
     editor: Editor,
@@ -351,6 +352,33 @@ struct Capture {
     message: Option<String>,
     scale: f64,
 }
+
+fn redaction_palette(image: &Image, selection: Rect, bounds: Rect) -> crate::redaction::Palette {
+    let Some(crop) = geometry::pixel_rect(
+        selection,
+        bounds,
+        Size::new(image.width() as f64, image.height() as f64),
+    ) else {
+        return crate::redaction::Palette::DARK;
+    };
+    let mut samples = Vec::with_capacity(1024);
+    for region in crate::drawing::redaction_sample_regions(image.width(), image.height(), crop) {
+        let width = region.size.width as usize;
+        let height = region.size.height as usize;
+        let columns = width.min(32);
+        let rows = height.min(32);
+        for y in 0..rows {
+            for x in 0..columns {
+                let x = region.origin.x as usize + (2 * x + 1) * width / (2 * columns);
+                let y = region.origin.y as usize + (2 * y + 1) * height / (2 * rows);
+                let offset = (y * image.width() + x) * 4;
+                samples.push(image.pixels()[offset..offset + 4].try_into().unwrap());
+            }
+        }
+    }
+    crate::redaction::palette_from_samples(&samples)
+}
+
 enum Reply {
     Mosaic(u64, u64, Result<Arc<Stamp>, String>),
     Captured(u64, Result<(Image, Rect, Rect, f64), String>),
@@ -766,7 +794,7 @@ impl App {
                         if !stale {
                             if let Some(error) = error {
                                 c.message = Some(error);
-                            } else if c.message.as_deref() == Some("Preparing pixelation…") {
+                            } else if c.message.as_deref() == Some("Preparing redaction…") {
                                 c.message = None;
                             }
                         }
@@ -802,6 +830,7 @@ impl App {
                                         selection: Rect::ZERO,
                                         start: None,
                                         crop: None,
+                                        redaction_selection: Rect::ZERO,
                                         raster: None,
                                         cache: RasterCacheState::default(),
                                         editor: Editor::default(),
@@ -990,6 +1019,7 @@ impl App {
             }
         };
         c.crop = Some(crop.clone());
+        c.redaction_selection = c.selection;
         if c.mode == CaptureMode::Copy {
             self.export();
             return;
@@ -1040,17 +1070,29 @@ impl App {
             return;
         };
         let canvas = c.zoom.as_ref().map_or(c.selection, |z| z.to);
-        let cell = (12. * c.scale * crop.width() as f64 / canvas.size.width).round() as usize;
-        let Some((revision, marks)) = c.editor.pixelation_job() else {
+        let cell =
+            ((12. * c.scale * crop.width() as f64 / canvas.size.width).round() as usize).max(1);
+        let Some((revision, seed, tone)) = c.editor.pixelation_job() else {
             return;
         };
+        let width = crop.width();
+        let height = crop.height();
+        let source = c.original.clone();
+        let selection = c.redaction_selection;
+        let bounds = r(0., 0., c.desktop.size.width, c.desktop.size.height);
         let generation = self.generation;
         self.image_workers += 1;
         native::worker(self.sender.clone(), self.host.handle, move || {
+            let automatic = if tone == RedactionTone::Auto {
+                redaction_palette(&source, selection, bounds)
+            } else {
+                crate::redaction::Palette::DARK
+            };
             Reply::Mosaic(
                 generation,
                 revision,
-                image::render(&crop, &marks).and_then(|image| image::pixelated(&image, cell)),
+                crate::redaction::generate(width, height, cell, seed, tone.palette(automatic))
+                    .and_then(Stamp::new),
             )
         });
     }
@@ -1249,6 +1291,14 @@ impl App {
                     && !c.busy
                 {
                     c.editor.color_index = (id - 30) as usize;
+                }
+            }
+            34..=36 => {
+                if let Some(c) = self.capture.as_mut()
+                    && !c.busy
+                {
+                    c.editor
+                        .set_redaction_tone(RedactionTone::ALL[(id - 34) as usize]);
                 }
             }
             40 => self.history(false),
@@ -1462,7 +1512,7 @@ impl App {
                     return;
                 }
                 if c.editor.tool.is_pixelation() && !c.editor.pixelation_ready() {
-                    c.message = Some("Preparing pixelation…".into());
+                    c.message = Some("Preparing redaction…".into());
                     self.warm_pixelation();
                     self.dirty = true;
                     return;
@@ -2043,6 +2093,7 @@ fn button(renderer: &mut Renderer, b: &Button, hover: Option<i32>, focus: Option
         return;
     }
     let compact = b.rect.size.width <= 80. && b.key.is_empty();
+    let redaction_tool = matches!(b.id, 25 | 26);
     let action = !b.subtitle.is_empty();
     let short_action = action && b.rect.size.height <= 80.;
     let padding = if action {
@@ -2064,16 +2115,20 @@ fn button(renderer: &mut Renderer, b: &Button, hover: Option<i32>, focus: Option
         r(
             b.rect.origin.x + padding,
             b.rect.origin.y
-                + if action {
+                + if redaction_tool {
+                    5.
+                } else if action {
                     if short_action { 14. } else { 20. }
                 } else {
                     (b.rect.size.height - 20.) / 2.
                 },
             text_width,
-            if action { 32. } else { 24. },
+            if action || redaction_tool { 32. } else { 24. },
         ),
         if action {
             if short_action { 16 } else { 20 }
+        } else if redaction_tool {
+            11
         } else if compact {
             12
         } else {
@@ -2216,9 +2271,17 @@ fn draw_capture(c: &mut Capture, hover: Option<i32>, focus: Option<i32>) -> Resu
             56. * scale,
         );
         renderer.fill(bar, 12., render::SURFACE);
-        for (i, label) in ["Pen", "Arrow", "Box", "Mark", "Text", "Pixel", "Brush"]
-            .into_iter()
-            .enumerate()
+        for (i, label) in [
+            "Pen",
+            "Arrow",
+            "Box",
+            "Mark",
+            "Text",
+            "Redact\narea",
+            "Redact\nbrush",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mut b = Button::new(
                 20 + i as i32,
@@ -2233,24 +2296,41 @@ fn draw_capture(c: &mut Capture, hover: Option<i32>, focus: Option<i32>) -> Resu
             b.selected = c.editor.tool == Tool::ALL[i];
             buttons.push(b);
         }
-        for (i, color) in COLORS.into_iter().enumerate() {
-            let mut b = Button::new(
-                30 + i as i32,
-                r(
-                    bar.origin.x + (408. + i as f64 * 32.) * scale,
-                    bar.origin.y + 8. * scale,
-                    28. * scale,
-                    40. * scale,
-                ),
-                "",
-            );
-            b.swatch = Some(
-                ((color[0] * 255.).round() as u32) << 16
-                    | ((color[1] * 255.).round() as u32) << 8
-                    | (color[2] * 255.).round() as u32,
-            );
-            b.selected = c.editor.color_index == i;
-            buttons.push(b);
+        if c.editor.tool.is_pixelation() {
+            for (i, tone) in RedactionTone::ALL.into_iter().enumerate() {
+                let mut b = Button::new(
+                    34 + i as i32,
+                    r(
+                        bar.origin.x + (400. + i as f64 * 48.) * scale,
+                        bar.origin.y + 8. * scale,
+                        46. * scale,
+                        40. * scale,
+                    ),
+                    tone.label(),
+                );
+                b.selected = c.editor.redaction_tone == tone;
+                buttons.push(b);
+            }
+        } else {
+            for (i, color) in COLORS.into_iter().enumerate() {
+                let mut b = Button::new(
+                    30 + i as i32,
+                    r(
+                        bar.origin.x + (408. + i as f64 * 32.) * scale,
+                        bar.origin.y + 8. * scale,
+                        28. * scale,
+                        40. * scale,
+                    ),
+                    "",
+                );
+                b.swatch = Some(
+                    ((color[0] * 255.).round() as u32) << 16
+                        | ((color[1] * 255.).round() as u32) << 8
+                        | (color[2] * 255.).round() as u32,
+                );
+                b.selected = c.editor.color_index == i;
+                buttons.push(b);
+            }
         }
         let mut undo = Button::new(
             40,
@@ -2539,6 +2619,7 @@ fn execute() -> Result<(), String> {
 }
 fn self_test() -> Result<(), String> {
     panel_geometry_test()?;
+    redaction_palette_test()?;
     update_policy_test()?;
     let source = image::synthetic(64, 48)?;
     let crop = image::crop(&source, r(5., 7., 21., 17.), r(0., 0., 64., 48.))?;
@@ -2633,9 +2714,15 @@ fn self_test() -> Result<(), String> {
         ) {
             return Err("Text annotation insertion failed".into());
         }
-        let (revision, marks) = editor.pixelation_job().ok_or("Missing pixelation job")?;
-        let mosaic = image::pixelated(&image::render(&fixture, &marks)?, 16)?;
-        editor.complete_pixelation(revision, Some(mosaic));
+        let (revision, seed, tone) = editor.pixelation_job().ok_or("Missing redaction job")?;
+        let texture = Stamp::new(crate::redaction::generate(
+            fixture.width(),
+            fixture.height(),
+            16,
+            seed,
+            tone.palette(crate::redaction::Palette::DARK),
+        )?)?;
+        editor.complete_pixelation(revision, Some(texture));
         for tool in [Tool::PixelateArea, Tool::PixelateBrush] {
             editor.tool = tool;
             editor.begin(Point::new(20., 20.), 1.);
@@ -2663,6 +2750,47 @@ fn self_test() -> Result<(), String> {
     }
     Ok(())
 }
+
+fn redaction_palette_test() -> Result<(), String> {
+    let bounds = r(7., 11., 40., 30.);
+    let selection = r(12.125, 15.375, 18.2, 9.4);
+    let exported = geometry::pixel_rect(selection, bounds, Size::new(80., 60.))
+        .ok_or("Missing fractional crop in redaction self-test")?;
+    let make = |hidden: [u8; 4]| {
+        let mut rgba = [214, 211, 205, 255].repeat(80 * 60);
+        for y in exported.origin.y as usize..(exported.origin.y + exported.size.height) as usize {
+            for x in exported.origin.x as usize..(exported.origin.x + exported.size.width) as usize
+            {
+                rgba[(y * 80 + x) * 4..(y * 80 + x) * 4 + 4].copy_from_slice(&hidden);
+            }
+        }
+        Image::from_rgba(80, 60, rgba)
+    };
+    let a = make([255, 255, 255, 255])?;
+    let b = make([0, 0, 0, 255])?;
+    let palette = redaction_palette(&a, selection, bounds);
+    let other_palette = redaction_palette(&b, selection, bounds);
+    if palette != other_palette
+        || palette != crate::redaction::palette_from_samples(&[[214, 211, 205, 255]])
+        || redaction_palette(&a, bounds, bounds) != crate::redaction::Palette::DARK
+    {
+        return Err("Automatic redaction tone sampled inside the exported crop".into());
+    }
+    let generate = |palette| {
+        crate::redaction::generate(
+            exported.size.width as usize,
+            exported.size.height as usize,
+            8,
+            [19; 32],
+            palette,
+        )
+    };
+    if generate(palette)?.pixels() != generate(other_palette)?.pixels() {
+        return Err("Redaction texture depends on hidden crop content".into());
+    }
+    Ok(())
+}
+
 fn panel_geometry_test() -> Result<(), String> {
     // Realistic top/bottom/side taskbars, negative desktop coordinates, mixed
     // DPI, an overflow/cursor anchor, and a work area smaller than the panel.

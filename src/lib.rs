@@ -4,6 +4,7 @@ pub mod editor;
 pub mod geometry;
 pub mod model;
 pub mod portable_image;
+pub mod redaction;
 pub mod refresh;
 pub mod updater;
 #[cfg(not(target_os = "macos"))]
