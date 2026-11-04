@@ -17,7 +17,7 @@ use objc2_quartz_core::{CACurrentMediaTime, CADisplayLink, CAFrameRateRange, CAT
 
 use crate::{
     compositor::Compositor,
-    editor::{COLORS, CacheRequest, Editor, RasterCacheState},
+    editor::{COLORS, CacheRequest, Editor, RasterCacheState, RedactionTone},
     frame_probe::FrameProbe,
     geometry,
     imaging::{self, Image, Mark, Tool},
@@ -50,6 +50,7 @@ struct State {
     selection: NSRect,
     start: Option<NSPoint>,
     crop: Option<Image>,
+    redaction_selection: NSRect,
     cached_image: Option<Image>,
     cache: RasterCacheState,
     editing: bool,
@@ -347,13 +348,19 @@ impl OverlayView {
                 };
                 let w = crop.width() as f64;
                 let h = crop.height() as f64;
-                if let Some((revision, marks)) = s.editor.pixelation_job() {
-                    let source = imaging::render(s.crop.as_ref().unwrap(), &marks)?;
-                    let stamp = imaging::pixelated(&source, 16)?;
+                if let Some((revision, seed, tone)) = s.editor.pixelation_job() {
+                    let palette = tone.palette(imaging::redaction_palette(
+                        &self.ivars().image,
+                        s.redaction_selection,
+                        self.bounds(),
+                    ));
+                    let stamp = crate::drawing::Stamp::new(crate::redaction::generate(
+                        w as usize, h as usize, 16, seed, palette,
+                    )?)?;
                     s.editor.complete_pixelation(revision, Some(stamp));
                 }
                 if !s.editor.pixelation_ready() {
-                    return Err("Pixelation preparation timed out".into());
+                    return Err("Redaction preparation timed out".into());
                 }
                 for (tool, a, b) in [
                     (
@@ -378,7 +385,7 @@ impl OverlayView {
                 if s.editor.marks.len() != count {
                     return Err("History lost an annotation".into());
                 }
-                s.editor.tool = Tool::Pen;
+                s.editor.tool = Tool::PixelateArea;
                 let rendered = imaging::render(s.crop.as_ref().unwrap(), &s.editor.marks)?;
                 std::fs::create_dir_all("artifacts").map_err(|e| e.to_string())?;
                 std::fs::write(
@@ -388,6 +395,13 @@ impl OverlayView {
                 .map_err(|e| e.to_string())?;
             }
             self.refresh_buttons();
+            for slot in self.ivars().buttons.borrow().iter() {
+                if ((30..=33).contains(&slot.tag) && !slot.button.isHidden())
+                    || ((34..=36).contains(&slot.tag) && slot.button.isHidden())
+                {
+                    return Err("Redaction tone controls did not replace pen colors".into());
+                }
+            }
             self.refresh_text_input();
             self.setNeedsDisplay(true);
             self.displayIfNeeded();
@@ -471,6 +485,7 @@ impl OverlayView {
                 selection: NSRect::ZERO,
                 start: None,
                 crop: None,
+                redaction_selection: NSRect::ZERO,
                 cached_image: None,
                 cache: RasterCacheState::default(),
                 editing: false,
@@ -957,18 +972,28 @@ impl OverlayView {
         accepted
     }
     fn warm_pixelation(&self) {
-        let job = {
+        let (width, height, cell, revision, seed, tone, selection) = {
             let mut s = self.ivars().state.borrow_mut();
             let Some(crop) = s.crop.clone() else {
                 return;
             };
             let canvas = s.zoom.as_ref().map_or(s.selection, |z| z.to);
-            let cell = (12. * crop.width() as f64 / canvas.size.width).round() as usize;
-            let Some((revision, marks)) = s.editor.pixelation_job() else {
+            let cell = ((12. * crop.width() as f64 / canvas.size.width).round() as usize).max(1);
+            let Some((revision, seed, tone)) = s.editor.pixelation_job() else {
                 return;
             };
-            (crop, cell, revision, marks)
+            (
+                crop.width(),
+                crop.height(),
+                cell,
+                revision,
+                seed,
+                tone,
+                s.redaction_selection,
+            )
         };
+        let source = self.ivars().image.clone();
+        let bounds = self.bounds();
         let owner = unsafe { Retained::retain(self as *const Self as *mut Self) }.unwrap();
         let owner = MainThreadBound::new(Weak::from_retained(&owner), self.mtm());
         DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
@@ -976,20 +1001,29 @@ impl OverlayView {
         ))
         .exec_async(move || {
             let result = autoreleasepool(|_| {
-                imaging::render(&job.0, &job.3).and_then(|image| imaging::pixelated(&image, job.1))
+                let automatic = if tone == RedactionTone::Auto {
+                    imaging::redaction_palette(&source, selection, bounds)
+                } else {
+                    crate::redaction::Palette::DARK
+                };
+                crate::redaction::generate(width, height, cell, seed, tone.palette(automatic))
+                    .and_then(crate::drawing::Stamp::new)
             });
             DispatchQueue::main().exec_async(move || {
                 let mtm = MainThreadMarker::new().unwrap();
                 if let Some(view) = owner.get(mtm).load() {
                     let again = {
                         let mut s = view.ivars().state.borrow_mut();
-                        if let Err(error) = &result {
-                            s.message = Some(error.clone());
-                        } else if s.message.as_deref() == Some("Preparing pixelation…") {
-                            s.message = None;
+                        let error = result.as_ref().err().cloned();
+                        let stale = s.editor.complete_pixelation(revision, result.ok());
+                        if !stale {
+                            if let Some(error) = error {
+                                s.message = Some(error);
+                            } else if s.message.as_deref() == Some("Preparing redaction…") {
+                                s.message = None;
+                            }
                         }
-                        s.editor.complete_pixelation(job.2, result.ok())
-                            && s.editor.tool.is_pixelation()
+                        stale && s.editor.tool.is_pixelation()
                     };
                     if again {
                         view.warm_pixelation();
@@ -1055,7 +1089,7 @@ impl OverlayView {
                         return;
                     }
                     if s.editor.tool.is_pixelation() && !s.editor.pixelation_ready() {
-                        s.message = Some("Preparing pixelation…".into());
+                        s.message = Some("Preparing redaction…".into());
                         drop(s);
                         self.warm_pixelation();
                         self.request_frame();
@@ -1150,6 +1184,7 @@ impl OverlayView {
         let mode = {
             let mut s = self.ivars().state.borrow_mut();
             s.crop = Some(crop.clone());
+            s.redaction_selection = selection;
             s.cached_image = Some(crop);
             s.cache.reset();
             s.mode
@@ -1387,6 +1422,12 @@ impl OverlayView {
             11 => self.handle_arrow(CaptureMode::Markup),
             20..=26 => self.ivars().state.borrow_mut().editor.tool = Tool::ALL[(tag - 20) as usize],
             30..=33 => self.ivars().state.borrow_mut().editor.color_index = (tag - 30) as usize,
+            34..=36 => self
+                .ivars()
+                .state
+                .borrow_mut()
+                .editor
+                .set_redaction_tone(RedactionTone::ALL[(tag - 34) as usize]),
             40 => self.change_history(false),
             41 => self.copy_result(),
             42 => self.change_history(true),
@@ -1434,19 +1475,16 @@ impl OverlayView {
                 "",
                 Some("square.dashed.inset.filled"),
                 "",
-                "Pixelate an area",
+                "Redact area",
             ),
-            (
-                26,
-                "",
-                Some("paintbrush.pointed"),
-                "",
-                "Pixelate with a brush",
-            ),
+            (26, "", Some("paintbrush.pointed"), "", "Redact brush"),
             (30, "", None, "", "Red"),
             (31, "", None, "", "Lime"),
             (32, "", None, "", "Cyan"),
             (33, "", None, "", "White"),
+            (34, "Auto", None, "", "Automatic redaction tone"),
+            (35, "Dark", None, "", "Dark redaction tone"),
+            (36, "Light", None, "", "Light redaction tone"),
             (40, "", Some("arrow.uturn.backward"), "", "Undo (⌘Z)"),
             (42, "", Some("arrow.uturn.forward"), "", "Redo (⌘⇧Z)"),
             (
@@ -1466,7 +1504,7 @@ impl OverlayView {
             };
             let button = Button::new(self.mtm(), title, "", symbol, key, style);
             button.setTag(tag);
-            if matches!(tag,10|11|20..=26|30..=33) {
+            if matches!(tag,10|11|20..=26|30..=36) {
                 button.setButtonType(NSButtonType::PushOnPushOff);
             }
             button.setToolTip(Some(&NSString::from_str(label)));
@@ -1513,6 +1551,12 @@ impl OverlayView {
                     32.,
                     36.,
                 ),
+                34..=36 => rect(
+                    bar.origin.x + 304. + (slot.tag - 34) as f64 * 46.,
+                    bar.origin.y + 8.,
+                    46.,
+                    36.,
+                ),
                 40 => rect(bar.origin.x + 456., bar.origin.y + 8., 32., 36.),
                 42 => rect(bar.origin.x + 492., bar.origin.y + 8., 32., 36.),
                 41 => rect(bar.origin.x + 544., bar.origin.y + 8., 112., 36.),
@@ -1539,9 +1583,10 @@ impl OverlayView {
                 11 => s.mode == CaptureMode::Markup,
                 20..=26 => tool_index(s.editor.tool) == slot.tag - 20,
                 30..=33 => s.editor.color_index == (slot.tag - 30) as usize,
+                34..=36 => s.editor.redaction_tone == RedactionTone::ALL[(slot.tag - 34) as usize],
                 _ => false,
             };
-            if matches!(slot.tag,10|11|20..=26|30..=33) {
+            if matches!(slot.tag,10|11|20..=26|30..=36) {
                 slot.button.selected(selected);
                 slot.button
                     .setAccessibilityValueDescription(Some(&NSString::from_str(if selected {
@@ -1550,7 +1595,11 @@ impl OverlayView {
                         "Not selected"
                     })));
             }
-            let hidden = if slot.tag >= 20 {
+            let hidden = if (30..=33).contains(&slot.tag) {
+                !s.editing || s.editor.tool.is_pixelation()
+            } else if (34..=36).contains(&slot.tag) {
+                !s.editing || !s.editor.tool.is_pixelation()
+            } else if slot.tag >= 20 {
                 !s.editing
             } else {
                 s.editing && slot.tag != 12

@@ -2,6 +2,7 @@
 use crate::coordinates::Point as NSPoint;
 
 use crate::drawing::{Mark, Stamp, Tool};
+use crate::redaction::{Palette, Seed};
 use std::sync::Arc;
 
 // A screenshot editor should not accumulate unbounded paths if an input device
@@ -16,6 +17,34 @@ pub const COLORS: [[f64; 4]; 4] = [
     [0.12, 0.78, 1.0, 1.0],
     [1.0, 1.0, 1.0, 1.0],
 ];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RedactionTone {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+impl RedactionTone {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Dark, Self::Light];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+
+    pub fn palette(self, automatic: Palette) -> Palette {
+        match self {
+            Self::Auto => automatic,
+            Self::Dark => Palette::DARK,
+            Self::Light => Palette::LIGHT,
+        }
+    }
+}
 
 /// Tracks the immutable raster's committed prefix. A single job may be pending;
 /// history edits invalidate its generation without starting parallel rebuilds.
@@ -100,6 +129,8 @@ pub struct Editor {
     pub redo: Vec<Mark>,
     pub current: Option<Mark>,
     pub pixelation: Option<Arc<Stamp>>,
+    pub redaction_tone: RedactionTone,
+    redaction_seed: Seed,
     revision: u64,
     pixelation_revision: u64,
     pixelation_pending: Option<u64>,
@@ -116,6 +147,8 @@ impl Default for Editor {
             redo: Vec::new(),
             current: None,
             pixelation: None,
+            redaction_tone: RedactionTone::Auto,
+            redaction_seed: crate::redaction::fresh_seed(),
             revision: 1,
             pixelation_revision: 0,
             pixelation_pending: None,
@@ -234,14 +267,21 @@ impl Editor {
     pub fn pixelation_ready(&self) -> bool {
         self.pixelation.is_some() && self.pixelation_revision == self.revision
     }
-    pub fn pixelation_job(&mut self) -> Option<(u64, Vec<Mark>)> {
+    pub fn pixelation_job(&mut self) -> Option<(u64, Seed, RedactionTone)> {
         if self.pixelation_ready() || self.pixelation_pending.is_some() {
             return None;
         }
         self.pixelation_pending = Some(self.revision);
-        Some((self.revision, self.marks.clone()))
+        Some((self.revision, self.redaction_seed, self.redaction_tone))
     }
-    /// Only the newest history can supply a source. A stale completion releases
+    pub fn set_redaction_tone(&mut self, tone: RedactionTone) {
+        if self.redaction_tone != tone {
+            self.commit_current();
+            self.redaction_tone = tone;
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+    /// Only the newest history/settings may install a prepared texture. A stale completion releases
     /// the one worker slot and requests another build if the tool still needs it.
     pub fn complete_pixelation(&mut self, revision: u64, result: Option<Arc<Stamp>>) -> bool {
         if self.pixelation_pending != Some(revision) {
@@ -317,20 +357,22 @@ mod tests {
         NSPoint::new(x, y)
     }
     #[test]
-    fn pixelation_uses_latest_history_and_commits_only_its_patch() {
+    fn redaction_reuses_capture_seed_rejects_stale_jobs_and_commits_only_its_patch() {
         let source = crate::portable_image::synthetic(96, 80).unwrap();
         let mut e = Editor::default();
-        let (old, _) = e.pixelation_job().unwrap();
+        let (old, seed, tone) = e.pixelation_job().unwrap();
         assert!(e.pixelation_job().is_none());
         e.begin(point(12., 12.), 1.);
         e.end(point(60., 40.));
-        let stale = crate::portable_image::pixelated(&source, 8).unwrap();
+        let texture =
+            crate::redaction::generate(96, 80, 8, seed, tone.palette(Palette::DARK)).unwrap();
+        let stale = Stamp::new(texture.clone()).unwrap();
         assert!(e.complete_pixelation(old, Some(stale)));
         assert!(!e.pixelation_ready());
-        let (revision, marks) = e.pixelation_job().unwrap();
-        assert_eq!(marks.len(), 1);
-        let visible = crate::portable_image::render(&source, &marks).unwrap();
-        let prepared = crate::portable_image::pixelated(&visible, 8).unwrap();
+        let (revision, next_seed, _) = e.pixelation_job().unwrap();
+        assert_eq!(seed, next_seed);
+        let visible = crate::portable_image::render(&source, &e.marks).unwrap();
+        let prepared = Stamp::new(texture.clone()).unwrap();
         e.complete_pixelation(revision, Some(prepared));
         assert!(e.pixelation_ready());
         e.tool = Tool::PixelateArea;
@@ -355,6 +397,31 @@ mod tests {
         assert!(!e.pixelation_ready());
         e.redo();
         assert!(!e.pixelation_ready());
+        let (_, next_seed, _) = e.pixelation_job().unwrap();
+        assert_eq!(seed, next_seed);
+        assert_eq!(
+            texture.pixels(),
+            crate::redaction::generate(96, 80, 8, next_seed, Palette::DARK)
+                .unwrap()
+                .pixels()
+        );
+    }
+
+    #[test]
+    fn redaction_tone_preserves_pen_color_and_failed_preparation_can_retry() {
+        let mut e = Editor {
+            color_index: 2,
+            ..Editor::default()
+        };
+        let (revision, seed, _) = e.pixelation_job().unwrap();
+        e.set_redaction_tone(RedactionTone::Light);
+        assert!(e.complete_pixelation(revision, None));
+        let (revision, next_seed, tone) = e.pixelation_job().unwrap();
+        assert_eq!(seed, next_seed);
+        assert_eq!(tone, RedactionTone::Light);
+        assert_eq!(e.color_index, 2);
+        assert!(!e.complete_pixelation(revision, None));
+        assert!(e.pixelation_job().is_some());
     }
 
     #[test]

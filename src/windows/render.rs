@@ -282,8 +282,14 @@ impl Renderer {
                 return Ok(());
             }
             let scale = (canvas.size.width / image.width() as f64) as f32;
-            self.target
-                .PushAxisAlignedClip(&native(canvas), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            self.target.PushAxisAlignedClip(
+                &native(canvas),
+                if mark.tool.is_pixelation() {
+                    D2D1_ANTIALIAS_MODE_ALIASED
+                } else {
+                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
+                },
+            );
             self.target.SetTransform(&matrix(
                 scale,
                 canvas.origin.x as f32,
@@ -320,12 +326,14 @@ impl Renderer {
                 }
                 let last = *mark.points.last().unwrap();
                 let mask: ID2D1Geometry = if mark.tool == Tool::PixelateArea {
+                    let left = p.x.min(last.x).floor();
+                    let top = p.y.min(last.y).floor();
                     self.factory
                         .CreateRectangleGeometry(&native(r(
-                            p.x.min(last.x),
-                            p.y.min(last.y),
-                            (last.x - p.x).abs(),
-                            (last.y - p.y).abs(),
+                            left,
+                            top,
+                            p.x.max(last.x).ceil() - left,
+                            p.y.max(last.y).ceil() - top,
                         )))?
                         .cast()?
                 } else if mark.points.iter().all(|q| q == &p) {
@@ -371,7 +379,9 @@ impl Renderer {
                         bottom: f32::MAX,
                     },
                     geometricMask: std::mem::ManuallyDrop::new(Some(mask)),
-                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    // Opaque synthetic pixels replace the screenshot at every
+                    // covered sample; mask edges cannot mix original content.
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_ALIASED,
                     maskTransform: matrix(1., 0., 0.),
                     opacity: 1.,
                     ..Default::default()

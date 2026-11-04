@@ -73,15 +73,21 @@ impl Mark {
                 let first = self.points[0];
                 let last = *self.points.last().unwrap();
                 CGContext::save_g_state(c);
+                // Redaction has binary coverage: no original pixels may show
+                // through antialiased clip edges or interpolated texture alpha.
+                CGContext::set_allows_antialiasing(c, false);
+                CGContext::set_should_antialias(c, false);
                 CGContext::set_interpolation_quality(c, CGInterpolationQuality::None);
                 if self.tool == Tool::PixelateArea {
+                    let left = first.x.min(last.x).floor();
+                    let top = first.y.min(last.y).floor();
                     CGContext::clip_to_rect(
                         c,
                         rect(
-                            first.x.min(last.x),
-                            first.y.min(last.y),
-                            (last.x - first.x).abs(),
-                            (last.y - first.y).abs(),
+                            left,
+                            top,
+                            first.x.max(last.x).ceil() - left,
+                            first.y.max(last.y).ceil() - top,
                         ),
                     );
                 } else if self.points.iter().all(|p| p == &first) {
@@ -258,39 +264,52 @@ pub fn from_rgba(width: usize, height: usize, pixels: &[u8]) -> Result<Image, St
         CGBitmapContextCreateImage(Some(&context)).ok_or("Could not create annotation image")?,
     )
 }
-pub fn pixelated(
+/// Sample only small strips outside the full exported crop. Called by the
+/// preparation worker while it still owns the immutable full-screen context.
+pub fn redaction_palette(
     image: &Image,
-    cell: usize,
-) -> Result<std::sync::Arc<crate::drawing::Stamp>, String> {
-    let context = bitmap_context(image.width(), image.height())?;
-    CGContext::draw_image(
-        Some(&context),
-        rect(0., 0., image.width() as f64, image.height() as f64),
-        Some(image.cg_image()),
-    );
-    let stride = CGBitmapContextGetBytesPerRow(Some(&context));
-    let data = CGBitmapContextGetData(Some(&context)).cast::<u8>();
-    if data.is_null() {
-        return Err("Could not read mosaic pixels".into());
-    }
-    let mut rgba = vec![0; image.width() * image.height() * 4];
-    for row in 0..image.height() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.add(row * stride),
-                rgba.as_mut_ptr().add(row * image.width() * 4),
-                image.width() * 4,
-            );
+    selection: NSRect,
+    bounds: NSRect,
+) -> crate::redaction::Palette {
+    let Some(crop) = geometry::pixel_rect(
+        selection,
+        bounds,
+        NSSize::new(image.width() as f64, image.height() as f64),
+    ) else {
+        return crate::redaction::Palette::DARK;
+    };
+    let mut samples = Vec::new();
+    for region in crate::drawing::redaction_sample_regions(image.width(), image.height(), crop) {
+        let width = (region.size.width as usize).min(32);
+        let height = (region.size.height as usize).min(32);
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let Some(strip) = CGImage::with_image_in_rect(Some(image.cg_image()), region) else {
+            continue;
+        };
+        let Ok(context) = bitmap_context(width, height) else {
+            continue;
+        };
+        CGContext::set_interpolation_quality(Some(&context), CGInterpolationQuality::None);
+        CGContext::draw_image(
+            Some(&context),
+            rect(0., 0., width as f64, height as f64),
+            Some(&strip),
+        );
+        let stride = CGBitmapContextGetBytesPerRow(Some(&context));
+        let data = CGBitmapContextGetData(Some(&context)).cast::<u8>();
+        if data.is_null() {
+            continue;
+        }
+        for y in 0..height {
+            for x in 0..width {
+                // The private context owns this storage throughout the read.
+                samples.push(unsafe { *data.add(y * stride + x * 4).cast::<[u8; 4]>() });
+            }
         }
     }
-    crate::portable_image::pixelated(
-        &crate::portable_image::Image::from_premultiplied_rgba(
-            image.width(),
-            image.height(),
-            rgba,
-        )?,
-        cell,
-    )
+    crate::redaction::palette_from_samples(&samples)
 }
 /// AppKit lays out and shapes text on the main thread. Its immutable raster is
 /// then safe to composite and encode on workers like every other annotation.
@@ -680,14 +699,20 @@ mod tests {
     use objc2_core_graphics::CGBitmapContextGetData;
     use objc2_image_io::CGImageSource;
     #[test]
-    fn prepared_stamp_and_pixelation_patch_keep_native_orientation() {
+    fn prepared_redaction_and_patch_keep_native_orientation() {
         let source = crate::portable_image::synthetic(96, 80).unwrap();
         let native = from_rgba(96, 80, source.pixels()).unwrap();
         let mut e = crate::editor::Editor::default();
-        let (revision, _) = e.pixelation_job().unwrap();
+        let (revision, seed, _) = e.pixelation_job().unwrap();
         e.complete_pixelation(
             revision,
-            Some(crate::portable_image::pixelated(&source, 8).unwrap()),
+            Some(
+                crate::drawing::Stamp::new(
+                    crate::redaction::generate(96, 80, 8, seed, crate::redaction::Palette::DARK)
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
         );
         e.tool = Tool::PixelateArea;
         e.begin(NSPoint::new(16., 12.), 1.);
@@ -699,6 +724,130 @@ mod tests {
                 sample(&actual, x, y),
                 expected.pixels()[(y * 96 + x) * 4..(y * 96 + x) * 4 + 4]
             );
+        }
+    }
+
+    #[test]
+    fn automatic_redaction_palette_is_independent_of_the_entire_retina_crop() {
+        let bounds = rect(7., 11., 40., 30.);
+        let selection = rect(12.125, 15.375, 18.2, 9.4);
+        let exported = geometry::pixel_rect(selection, bounds, NSSize::new(80., 60.)).unwrap();
+        let make = |hidden: [u8; 4]| {
+            let mut rgba = [214, 211, 205, 255].repeat(80 * 60);
+            for y in exported.origin.y as usize..(exported.origin.y + exported.size.height) as usize
+            {
+                for x in
+                    exported.origin.x as usize..(exported.origin.x + exported.size.width) as usize
+                {
+                    rgba[(y * 80 + x) * 4..(y * 80 + x) * 4 + 4].copy_from_slice(&hidden);
+                }
+            }
+            from_rgba(80, 60, &rgba).unwrap()
+        };
+        let a = make([255, 255, 255, 255]);
+        let b = make([0, 0, 0, 255]);
+        let palette = redaction_palette(&a, selection, bounds);
+        let other_palette = redaction_palette(&b, selection, bounds);
+        assert_eq!(palette, other_palette);
+        assert_eq!(
+            palette,
+            crate::redaction::palette_from_samples(&[[214, 211, 205, 255]])
+        );
+        let texture = |palette| {
+            crate::redaction::generate(
+                exported.size.width as usize,
+                exported.size.height as usize,
+                8,
+                [19; 32],
+                palette,
+            )
+            .unwrap()
+        };
+        assert_eq!(texture(palette).pixels(), texture(other_palette).pixels());
+        assert_eq!(
+            redaction_palette(&a, bounds, bounds),
+            crate::redaction::Palette::DARK
+        );
+    }
+
+    fn png_rgba(image: &Image) -> Vec<u8> {
+        let bytes = encode_png(image).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .unwrap();
+        let mut rgba = vec![0; reader.output_buffer_size().unwrap()];
+        let frame = reader.next_frame(&mut rgba).unwrap();
+        assert_eq!(frame.color_type, png::ColorType::Rgba);
+        rgba.truncate(frame.buffer_size());
+        rgba
+    }
+
+    #[test]
+    fn native_redaction_masks_replace_every_covered_pixel_without_source_blending() {
+        let a = [219, 16, 122, 255];
+        let b = [1, 244, 185, 255];
+        let source_a = from_rgba(32, 24, &a.repeat(32 * 24)).unwrap();
+        let source_b = from_rgba(32, 24, &b.repeat(32 * 24)).unwrap();
+        let stamp = crate::drawing::Stamp::new(
+            crate::redaction::generate(32, 24, 4, [71; 32], crate::redaction::Palette::DARK)
+                .unwrap(),
+        )
+        .unwrap();
+        for (tool, points, width) in [
+            (
+                Tool::PixelateArea,
+                vec![NSPoint::new(4.2, 5.7), NSPoint::new(25.8, 19.1)],
+                1.,
+            ),
+            (Tool::PixelateBrush, vec![NSPoint::new(15.4, 11.7)], 4.2),
+            (
+                Tool::PixelateBrush,
+                vec![
+                    NSPoint::new(4.4, 5.2),
+                    NSPoint::new(25.8, 18.6),
+                    NSPoint::new(18.4, 3.2),
+                ],
+                3.2,
+            ),
+        ] {
+            let mark = Mark {
+                tool,
+                points,
+                width,
+                color: [1.; 4],
+                stamp: Some(stamp.clone()),
+            };
+            let pixels_a = png_rgba(&render(&source_a, std::slice::from_ref(&mark)).unwrap());
+            let pixels_b = png_rgba(&render(&source_b, std::slice::from_ref(&mark)).unwrap());
+            let mut covered = 0;
+            for (index, (pa, pb)) in pixels_a
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(pixels_b.as_chunks::<4>().0)
+                .enumerate()
+            {
+                if pa == pb {
+                    covered += 1;
+                    assert_eq!(pa[3], 255);
+                } else {
+                    assert_eq!(*pa, a, "partial source mix at {index}, {tool:?}");
+                    assert_eq!(*pb, b, "partial source mix at {index}, {tool:?}");
+                }
+            }
+            assert!(covered > 40);
+            if tool == Tool::PixelateArea {
+                for y in 5..20 {
+                    for x in 4..26 {
+                        let offset = (y * 32 + x) * 4;
+                        assert_eq!(pixels_a[offset..offset + 4], pixels_b[offset..offset + 4]);
+                    }
+                }
+            }
+            // Cropping the cached stamp at commit preserves the same coverage.
+            let mut patched = mark.clone();
+            patched.stamp = Some(stamp.patch(&mark).unwrap());
+            assert_eq!(pixels_a, png_rgba(&render(&source_a, &[patched]).unwrap()));
         }
     }
 
