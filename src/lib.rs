@@ -5,6 +5,7 @@ pub mod geometry;
 pub mod model;
 pub mod portable_image;
 pub mod refresh;
+pub mod updater;
 #[cfg(not(target_os = "macos"))]
 pub use portable_image as imaging;
 #[cfg(target_os = "macos")]

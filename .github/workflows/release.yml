@@ -1,0 +1,288 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing vX.Y.Z tag (required to publish; optional for a build check)'
+        type: string
+        default: ''
+      publish:
+        description: 'Sign and publish the stable update feed using configured Mac signing mode'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: still-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_REPOSITORY: justerquate-sys/still
+  REQUIRED_PLATFORMS: macos-aarch64,macos-x86_64,windows-x86_64,windows-aarch64
+  # The owner uses personal signing without Apple Developer membership.
+  # Set this repository variable to developer-id to require Apple notarization.
+  MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE || 'personal' }}
+
+jobs:
+  prepare:
+    runs-on: macos-15
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate version, tag, and pinned update configuration
+        id: release
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, re, subprocess, tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
+              raise SystemExit('Release version must be stable X.Y.Z without build metadata')
+          publish = os.environ['PUBLISH'] == 'true'
+          if os.environ['MACOS_SIGNING_MODE'] not in ['personal', 'developer-id']:
+              raise SystemExit('MACOS_SIGNING_MODE must be personal or developer-id')
+          tag = 'v' + version
+          if publish:
+              requested = os.environ['REQUESTED_TAG'] or os.environ['GITHUB_REF_NAME']
+              if requested != tag:
+                  raise SystemExit('Publishing requires an existing v<Cargo version> tag')
+              head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              tagged = subprocess.check_output(['git', 'rev-parse', 'refs/tags/' + tag + '^{commit}'], text=True).strip()
+              if tagged != head or os.environ['GITHUB_REPOSITORY'] != os.environ['RELEASE_REPOSITORY']:
+                  raise SystemExit('Tag commit or public destination repository does not match')
+              config = json.loads(Path('Resources/update-config.json').read_text())
+              expected = f"https://github.com/{os.environ['RELEASE_REPOSITORY']}/releases/latest/download/updates.json"
+              if not config['enabled'] or config['manifest_url'] != expected or len(base64.b64decode(config['public_key'], validate=True)) != 32:
+                  raise SystemExit('Pinned public update configuration is incomplete')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\ntag={tag}\npublish={str(publish).lower()}\n')
+          PY
+
+  macos:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show
+          rustup target add '${{ matrix.target }}'
+      - name: Format, lint, and native unit tests
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --target '${{ matrix.target }}' --all-targets --locked -- -D warnings
+          cargo test --target '${{ matrix.target }}' --all-targets --locked
+      - name: Build native application bundle
+        env:
+          STILL_BUILD_TARGET: ${{ matrix.target }}
+        run: ./scripts/build.sh
+      - name: Download and verify pinned personal Mac signing tool
+        if: needs.prepare.outputs.publish == 'true' && env.MACOS_SIGNING_MODE == 'personal'
+        run: |
+          python3 scripts/download-rcodesign.py --destination "$RUNNER_TEMP/still-rcodesign"
+          printf 'RCODESIGN_PATH=%s\n' "$RUNNER_TEMP/still-rcodesign/rcodesign" >> "$GITHUB_ENV"
+      - name: Prepare temporary Mac signing credentials
+        if: needs.prepare.outputs.publish == 'true'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: bash scripts/prepare-macos-signing.sh
+      - name: Sign and package production application (notarize in Developer ID mode)
+        if: needs.prepare.outputs.publish == 'true'
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: ./scripts/package-macos.sh --production
+      - name: Package development build for inspection
+        if: needs.prepare.outputs.publish != 'true'
+        run: ./scripts/package-macos.sh
+      - name: Remove temporary signing credentials
+        if: always()
+        run: |
+          keychain="$RUNNER_TEMP/still-macos-signing/release.keychain-db"
+          if [[ -f "$keychain" ]]; then security delete-keychain "$keychain"; fi
+          rm -rf "$RUNNER_TEMP/still-macos-signing"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            arch: x64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add '${{ matrix.target }}'
+          exit $LASTEXITCODE
+      - name: Format, lint, and native unit tests
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --target '${{ matrix.target }}' --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --target '${{ matrix.target }}' --all-targets --locked
+          exit $LASTEXITCODE
+      - name: Import optional Authenticode certificate
+        if: needs.prepare.outputs.publish == 'true'
+        env:
+          WINDOWS_CERTIFICATE_P12_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_P12_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ($env:WINDOWS_CERTIFICATE_P12_BASE64) {
+            $path = Join-Path $env:RUNNER_TEMP 'still-authenticode.pfx'
+            [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_P12_BASE64))
+            try {
+              $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+              $certificates = @(Import-PfxCertificate -FilePath $path -CertStoreLocation Cert:/CurrentUser/My -Password $password | Where-Object { $_.HasPrivateKey })
+              if ($certificates.Count -ne 1) { throw 'P12 must contain exactly one signing certificate with a private key' }
+              $certificate = $certificates[0]
+              "WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
+            } finally { Remove-Item -LiteralPath $path -Force }
+          }
+      - name: Package native Windows executable and dependency licenses
+        env:
+          PRODUCTION: ${{ needs.prepare.outputs.publish }}
+        run: |
+          ./scripts/build-windows.ps1 -Target '${{ matrix.target }}' -Production:($env:PRODUCTION -eq 'true')
+          exit $LASTEXITCODE
+      - name: Executable self-test
+        run: |
+          $test = Start-Process 'target/${{ matrix.target }}/release/Still.exe' -ArgumentList '--self-test' -Wait -PassThru
+          exit $test.ExitCode
+      - name: Remove optional Authenticode certificate
+        if: always()
+        run: |
+          if ($env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+            Remove-Item "Cert:/CurrentUser/My/$env:WINDOWS_CERTIFICATE_THUMBPRINT" -DeleteKey -Force
+          }
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: release-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [prepare, macos, windows]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: macos-15
+    concurrency:
+      group: still-stable-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Install the pinned Rust toolchain and build release signer
+        run: |
+          rustup show
+          cargo build --release --locked --bin still-release
+      - name: Fetch the previous signed feed for monotonic version validation
+        env:
+          PREVIOUS_RELEASE_DIRECTORY: ${{ runner.temp }}/previous-still-release
+        run: python3 scripts/fetch-previous-release.py
+      - name: Create and verify the signed stable update feed
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          : "${UPDATE_SIGNING_KEY:?UPDATE_SIGNING_KEY repository secret is required}"
+          umask 077
+          key_path="$RUNNER_TEMP/still-update-signing-key"
+          trap 'rm -f "$key_path"' EXIT
+          printf '%s' "$UPDATE_SIGNING_KEY" > "$key_path"
+          unset UPDATE_SIGNING_KEY
+          previous=()
+          if [[ -d "$RUNNER_TEMP/previous-still-release" ]]; then
+            previous=(--previous-manifest "$RUNNER_TEMP/previous-still-release/updates.json" --previous-signature "$RUNNER_TEMP/previous-still-release/updates.json.sig")
+          fi
+          signing_policy=()
+          if [[ "$MACOS_SIGNING_MODE" == personal ]]; then signing_policy=(--allow-personal-macos); fi
+          target/release/still-release sign --private-key "$key_path" --artifacts dist --version "$VERSION" \
+            --repo "$RELEASE_REPOSITORY" --config Resources/update-config.json --require-platforms "$REQUIRED_PLATFORMS" "${previous[@]}" "${signing_policy[@]}"
+          target/release/still-release verify --manifest dist/updates.json --signature dist/updates.json.sig \
+            --config Resources/update-config.json --artifacts dist --version "$VERSION" --repo "$RELEASE_REPOSITORY" --require-platforms "$REQUIRED_PLATFORMS" "${signing_policy[@]}"
+      - name: Stage a draft release with every validated archive and the signed feed
+        run: |
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/updates.json dist/updates.json.sig \
+            --repo "$RELEASE_REPOSITORY" --verify-tag --draft --title "Still $VERSION" --generate-notes
+      - name: Verify the draft download bytes before activating the public feed
+        run: |
+          verification="$RUNNER_TEMP/still-release-verification"
+          mkdir "$verification"
+          gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --dir "$verification" \
+            --pattern '*.tar.gz' --pattern '*.zip' --pattern 'updates.json' --pattern 'updates.json.sig'
+          signing_policy=()
+          if [[ "$MACOS_SIGNING_MODE" == personal ]]; then signing_policy=(--allow-personal-macos); fi
+          target/release/still-release verify --manifest "$verification/updates.json" --signature "$verification/updates.json.sig" \
+            --config Resources/update-config.json --artifacts "$verification" --version "$VERSION" --repo "$RELEASE_REPOSITORY" --require-platforms "$REQUIRED_PLATFORMS" "${signing_policy[@]}"
+      - name: Publish the verified release and activate latest stable updates
+        run: gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --draft=false --latest

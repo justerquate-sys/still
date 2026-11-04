@@ -14,16 +14,20 @@ use objc2_service_management::SMAppService;
 use std::{
     cell::RefCell,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use still::{
     capture::{self, DisplayRequest, FrozenDisplay},
     imaging::{self, EncodedImage, Image, Mark},
-    model::{CaptureMode, TrayAction, TrayState},
+    model::{CaptureMode, TrayAction, TrayState, UpdateStatus},
     overlay::{OverlayAction, OverlayView},
     tray_panel::PanelView,
-    ui,
+    ui, updater,
 };
+
+const UPDATE_STARTUP_DELAY: Duration = Duration::from_secs(10);
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 thread_local! { static DELEGATE: RefCell<Option<Retained<StillDelegate>>> = const { RefCell::new(None) }; }
 
@@ -49,6 +53,15 @@ struct Surface {
     view: Retained<OverlayView>,
     frame: NSRect,
 }
+#[derive(Default)]
+struct Updates {
+    config: Option<Arc<updater::Config>>,
+    timer_generation: u64,
+    checking: bool,
+    prepared: Option<Arc<updater::PreparedUpdate>>,
+    applying: bool,
+    apply: Option<updater::ApplyProcess>,
+}
 pub struct State {
     model: TrayState,
     status: Option<Retained<NSStatusItem>>,
@@ -64,6 +77,8 @@ pub struct State {
     exporting: bool,
     demo: bool,
     ui_test: bool,
+    updates: Updates,
+    terminating: bool,
     toast: Option<Retained<NSPanel>>,
     toast_generation: u64,
     started: Instant,
@@ -101,10 +116,25 @@ impl State {
             exporting: false,
             demo: ui_test || args.iter().any(|arg| arg == "--demo"),
             ui_test,
+            updates: Updates::default(),
+            terminating: false,
             toast: None,
             toast_generation: 0,
             started: Instant::now(),
         }
+    }
+    fn updates_enabled(&self) -> bool {
+        !self.ui_test && !self.demo && !self.terminating
+    }
+    fn update_idle(&self) -> bool {
+        self.updates_enabled()
+            && !self.model.is_capturing
+            && self.surfaces.is_empty()
+            && !self.exporting
+            && !self
+                .popover
+                .as_ref()
+                .is_some_and(|popover| popover.isShown())
     }
 }
 
@@ -131,6 +161,12 @@ define_class!(
     unsafe impl NSWindowDelegate for StillDelegate {
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_key(&self, _: &NSNotification) { enqueue(|app| app.refresh()); }
+    }
+    unsafe impl NSPopoverDelegate for StillDelegate {
+        #[unsafe(method(popoverDidClose:))]
+        fn popover_closed(&self, _: &NSNotification) {
+            enqueue(|app| app.maybe_apply_update());
+        }
     }
     impl StillDelegate {
         #[unsafe(method(openMenu:))]
@@ -241,6 +277,7 @@ impl StillDelegate {
             );
         }
         self.refresh();
+        self.initialize_updates();
         let args: Vec<String> = std::env::args().collect();
         if args
             .iter()
@@ -336,6 +373,7 @@ impl StillDelegate {
         let controller = NSViewController::new(mtm);
         controller.setView(&panel);
         let popover = NSPopover::new(mtm);
+        popover.setDelegate(Some(ProtocolObject::from_ref(self)));
         popover.setBehavior(NSPopoverBehavior::Transient);
         popover.setAnimates(!ui::reduce_motion());
         popover.setContentViewController(Some(&controller));
@@ -388,6 +426,210 @@ impl StillDelegate {
             panel.update(&model);
         }
     }
+    fn initialize_updates(&self) {
+        if !self.ivars().borrow().updates_enabled() {
+            return;
+        }
+        let configured = {
+            let mut state = self.ivars().borrow_mut();
+            match updater::Config::embedded() {
+                Ok(Some(config)) => {
+                    state.updates.config = Some(Arc::new(config));
+                    state.model.update_status = UpdateStatus::Idle;
+                    true
+                }
+                Ok(None) => {
+                    state.model.update_status = UpdateStatus::NotConfigured;
+                    false
+                }
+                Err(error) => {
+                    state.model.update_status = UpdateStatus::Failed(error.to_string());
+                    false
+                }
+            }
+        };
+        self.update_menu();
+        if configured {
+            self.schedule_update_check(UPDATE_STARTUP_DELAY);
+        }
+    }
+    fn schedule_update_check(&self, delay: Duration) {
+        let generation = {
+            let mut state = self.ivars().borrow_mut();
+            if !state.updates_enabled()
+                || state.updates.config.is_none()
+                || state.updates.checking
+                || state.updates.prepared.is_some()
+                || state.updates.applying
+                || state.updates.apply.is_some()
+            {
+                return;
+            }
+            state.updates.timer_generation = state.updates.timer_generation.wrapping_add(1);
+            state.updates.timer_generation
+        };
+        after(delay, move |app| {
+            let current = {
+                let state = app.ivars().borrow();
+                state.updates_enabled() && state.updates.timer_generation == generation
+            };
+            if current {
+                app.check_for_updates();
+            }
+        });
+    }
+    fn check_for_updates(&self) {
+        let config = {
+            let mut state = self.ivars().borrow_mut();
+            if !state.updates_enabled()
+                || state.updates.checking
+                || state.updates.prepared.is_some()
+                || state.updates.applying
+                || state.updates.apply.is_some()
+            {
+                return;
+            }
+            // A manual check supersedes any startup/periodic callback that is
+            // still scheduled. Capture generations never invalidate this work.
+            state.updates.timer_generation = state.updates.timer_generation.wrapping_add(1);
+            state.updates.config.clone()
+        };
+        let config = if let Some(config) = config {
+            config
+        } else {
+            match updater::Config::embedded() {
+                Ok(Some(config)) => {
+                    let config = Arc::new(config);
+                    self.ivars().borrow_mut().updates.config = Some(Arc::clone(&config));
+                    config
+                }
+                Ok(None) => {
+                    self.ivars().borrow_mut().model.update_status = UpdateStatus::NotConfigured;
+                    self.update_menu();
+                    return;
+                }
+                Err(error) => {
+                    self.ivars().borrow_mut().model.update_status =
+                        UpdateStatus::Failed(error.to_string());
+                    self.update_menu();
+                    return;
+                }
+            }
+        };
+        {
+            let mut state = self.ivars().borrow_mut();
+            state.updates.checking = true;
+            state.model.update_status = UpdateStatus::Checking;
+        }
+        self.update_menu();
+        DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+            DispatchQoS::Utility,
+        ))
+        .exec_async(move || {
+            autoreleasepool(|_| {
+                let result = updater::InstallContext::current()
+                    .and_then(|context| updater::check_and_stage(&config, &context))
+                    .map_err(|error| error.to_string());
+                enqueue(move |app| app.update_checked(result));
+            });
+        });
+    }
+    fn update_checked(&self, result: Result<Option<updater::PreparedUpdate>, String>) {
+        let repeat = {
+            let mut state = self.ivars().borrow_mut();
+            if !state.updates_enabled() || !state.updates.checking {
+                return;
+            }
+            state.updates.checking = false;
+            match result {
+                Ok(Some(prepared)) => {
+                    state.model.update_status = UpdateStatus::Ready(prepared.version_string());
+                    state.updates.prepared = Some(Arc::new(prepared));
+                    false
+                }
+                Ok(None) => {
+                    state.model.update_status = UpdateStatus::UpToDate;
+                    true
+                }
+                Err(error) => {
+                    state.model.update_status = UpdateStatus::Failed(error);
+                    true
+                }
+            }
+        };
+        self.update_menu();
+        if repeat {
+            self.schedule_update_check(UPDATE_CHECK_INTERVAL);
+        }
+        self.maybe_apply_update();
+    }
+    fn maybe_apply_update(&self) {
+        let (guard, prepared) = {
+            let mut state = self.ivars().borrow_mut();
+            if !state.update_idle() || state.updates.checking {
+                return;
+            }
+            if state.updates.apply.is_some() {
+                (state.updates.apply.take(), None)
+            } else if !state.updates.applying
+                && let Some(prepared) = state.updates.prepared.as_ref().map(Arc::clone)
+            {
+                state.updates.applying = true;
+                state.updates.timer_generation = state.updates.timer_generation.wrapping_add(1);
+                state.model.update_status = UpdateStatus::Installing(prepared.version_string());
+                (None, Some(prepared))
+            } else {
+                return;
+            }
+        };
+        if let Some(guard) = guard {
+            guard.commit_on_exit();
+            {
+                let mut state = self.ivars().borrow_mut();
+                state.terminating = true;
+                state.updates.timer_generation = state.updates.timer_generation.wrapping_add(1);
+            }
+            NSApplication::sharedApplication(self.mtm()).terminate(None);
+        } else if let Some(prepared) = prepared {
+            self.update_menu();
+            DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+                DispatchQoS::Utility,
+            ))
+            .exec_async(move || {
+                autoreleasepool(|_| {
+                    let result = updater::start_apply(&prepared).map_err(|error| error.to_string());
+                    enqueue(move |app| app.update_apply_ready(result));
+                });
+            });
+        }
+    }
+    fn update_apply_ready(&self, result: Result<updater::ApplyProcess, String>) {
+        let retry = {
+            let mut state = self.ivars().borrow_mut();
+            if !state.updates_enabled() || !state.updates.applying {
+                return;
+            }
+            state.updates.applying = false;
+            match result {
+                Ok(guard) => {
+                    // If a capture or popover opened during helper setup, keep
+                    // the uncommitted helper waiting until the next idle action.
+                    state.updates.apply = Some(guard);
+                    false
+                }
+                Err(error) => {
+                    state.updates.prepared = None;
+                    state.model.update_status = UpdateStatus::Failed(error);
+                    true
+                }
+            }
+        };
+        self.update_menu();
+        if retry {
+            self.schedule_update_check(UPDATE_CHECK_INTERVAL);
+        }
+        self.maybe_apply_update();
+    }
     fn close_panel(&self) {
         let popover = self.ivars().borrow().popover.clone();
         if let Some(popover) = popover {
@@ -399,6 +641,9 @@ impl StillDelegate {
         }
     }
     fn show_menu(&self) {
+        if self.ivars().borrow().terminating {
+            return;
+        }
         if !self.ivars().borrow().surfaces.is_empty() {
             self.focus_capture();
             return;
@@ -445,6 +690,50 @@ impl StillDelegate {
             if !popover.isShown() {
                 return Err("Toolbar panel was not shown".into());
             }
+            if popover.delegate().is_none() {
+                return Err("Popover has no native close delegate for deferred updates".into());
+            }
+            self.check_for_updates();
+            self.schedule_update_check(Duration::ZERO);
+            self.maybe_apply_update();
+            {
+                let state = self.ivars().borrow();
+                if !state.ui_test
+                    || !state.demo
+                    || !matches!(state.model.update_status, UpdateStatus::NotConfigured)
+                    || state.updates.config.is_some()
+                    || state.updates.checking
+                    || state.updates.applying
+                    || state.updates.prepared.is_some()
+                    || state.updates.apply.is_some()
+                    || state.updates.timer_generation != 0
+                {
+                    return Err("Panel diagnostics unexpectedly enabled automatic updates".into());
+                }
+            }
+            let update = panel
+                .subviews()
+                .iter()
+                .find_map(|view| {
+                    view.downcast::<ui::Button>()
+                        .ok()
+                        .filter(|button| button.tag() == 15)
+                })
+                .ok_or("Panel has no update footer control")?;
+            for status in [
+                UpdateStatus::Checking,
+                UpdateStatus::Ready("2.5.1".into()),
+                UpdateStatus::Failed("Diagnostic offline".into()),
+                UpdateStatus::NotConfigured,
+            ] {
+                self.ivars().borrow_mut().model.update_status = status.clone();
+                self.update_menu();
+                if update.isEnabled() != status.can_check()
+                    || update.title().to_string() != status.label()
+                {
+                    return Err("Panel update status or enabled state did not refresh".into());
+                }
+            }
             let window = panel.window().ok_or("Panel has no native window")?;
             if panel.frame().size.width != still::tray_panel::WIDTH
                 || panel.frame().size.height != still::tray_panel::HEIGHT
@@ -477,7 +766,7 @@ impl StillDelegate {
         })();
         match result {
             Ok(()) => println!(
-                "PANEL CHECK: native status-icon anchor, compact untitled panel, dismiss/reopen passed"
+                "PANEL CHECK: native status-icon anchor, compact untitled panel, dismiss/reopen, update status and disabled diagnostic networking passed"
             ),
             Err(error) => {
                 eprintln!("PANEL CHECK FAILED: {error}");
@@ -489,6 +778,17 @@ impl StillDelegate {
 
     fn menu_action(&self, action: TrayAction) {
         match action {
+            TrayAction::CheckUpdates => {
+                if matches!(
+                    self.ivars().borrow().model.update_status,
+                    UpdateStatus::Ready(_)
+                ) {
+                    self.close_panel();
+                    enqueue(|app| app.maybe_apply_update());
+                } else {
+                    self.check_for_updates();
+                }
+            }
             TrayAction::Dismiss => self.close_panel(),
             TrayAction::Capture(mode) => self.start(mode),
             TrayAction::RequestPermission => self.request_permission(),
@@ -558,6 +858,9 @@ impl StillDelegate {
     }
 
     fn start(&self, mode: CaptureMode) {
+        if self.ivars().borrow().terminating {
+            return;
+        }
         if !self.ivars().borrow().surfaces.is_empty() {
             self.arrow(mode);
             return;
@@ -972,6 +1275,7 @@ impl StillDelegate {
             previous.activateWithOptions(NSApplicationActivationOptions::empty());
         }
         self.update_menu();
+        enqueue(|app| app.maybe_apply_update());
     }
 
     fn fail(&self, error: String) {
@@ -1048,6 +1352,17 @@ impl StillDelegate {
     }
 
     fn stop(&self) {
+        let guard = {
+            let mut state = self.ivars().borrow_mut();
+            state.terminating = true;
+            state.updates.timer_generation = state.updates.timer_generation.wrapping_add(1);
+            state.updates.checking = false;
+            state.updates.applying = false;
+            state.updates.prepared = None;
+            state.updates.apply.take()
+        };
+        // An ordinary quit cancels a helper that was prepared but never committed.
+        drop(guard);
         self.close_panel();
         self.cancel();
         self.hide_toast();

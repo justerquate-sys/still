@@ -38,7 +38,6 @@ define_class!(
             ui::text("Launch at login",20.,284.,13.,false,ui::TEXT);
             ui::text("Global shortcuts",20.,328.,13.,false,ui::TEXT);
             ui::separator(16.,360.,308.);
-            ui::text("Always in your menu bar",20.,376.,12.,false,ui::MUTED);
         }
         #[unsafe(method(panelAction:))]
         fn action(&self,sender:&NSControl) {self.activate(sender.tag());}
@@ -132,6 +131,15 @@ impl PanelView {
                 rect(300., 42., 24., 24.),
             ),
             (
+                15,
+                "Check for updates",
+                "",
+                Some("arrow.triangle.2.circlepath"),
+                "",
+                ButtonStyle::Quiet,
+                rect(16., 368., 244., 28.),
+            ),
+            (
                 5,
                 "Quit",
                 "",
@@ -160,6 +168,7 @@ impl PanelView {
             11 => TrayAction::SetShortcuts(ShortcutStyle::Plain),
             12 => TrayAction::SetShortcuts(ShortcutStyle::Modified),
             13 => TrayAction::RequestPermission,
+            15 => TrayAction::CheckUpdates,
             5 => TrayAction::Quit,
             _ => TrayAction::Dismiss,
         };
@@ -202,6 +211,22 @@ impl PanelView {
                     };
                     button.setAccessibilityLabel(Some(&NSString::from_str(title)));
                     button.setToolTip(Some(&NSString::from_str(title)));
+                }
+                15 => {
+                    button.setTitle(&NSString::from_str(&state.update_status.label()));
+                    button.setAccessibilityLabel(Some(&NSString::from_str(
+                        &state.update_status.label(),
+                    )));
+                    button.setEnabled(state.update_status.can_check());
+                    let detail = match &state.update_status {
+                        crate::model::UpdateStatus::Failed(error) => error.as_str(),
+                        crate::model::UpdateStatus::Ready(_) => {
+                            "Downloaded and verified. Installs when your capture is finished."
+                        }
+                        _ => "Signed updates from GitHub are checked automatically.",
+                    };
+                    button.setToolTip(Some(&NSString::from_str(detail)));
+                    NSView::setNeedsDisplay(button, true);
                 }
                 _ => {}
             }
