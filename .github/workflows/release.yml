@@ -31,7 +31,7 @@ env:
 
 jobs:
   prepare:
-    runs-on: macos-15
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
